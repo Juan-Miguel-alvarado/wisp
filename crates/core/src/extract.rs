@@ -215,6 +215,6 @@ mod tests {
 
     #[test]
     fn missing_file_errors() {
-        assert!(extract(Path::new("/nonexistent/deepsearch/xyz")).is_err());
+        assert!(extract(Path::new("/nonexistent/wisp/xyz")).is_err());
     }
 }

@@ -1,31 +1,52 @@
 [package]
-name = "deepsearch"
+name = "wisp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Relevance-ranked full-text search over all your files, with an interactive TUI."
+description = "A blazing-fast terminal file manager with yazi's UI and keymap, plus deep full-text search."
 
 [[bin]]
-name = "deepsearch"
+name = "wisp"
 path = "src/main.rs"
 
 [dependencies]
-deepsearch-core = { path = "../core" }
+wisp-core = { path = "../core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 ratatui = "0.30"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["serde"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 # `chafa-dyn` (a default feature) needs the libchafa system library; drop it.
 # Native Kitty/Sixel/iTerm2 protocols + Unicode-halfblock fallback remain.
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 image = "0.25"
-# Already in the tree via ratatui; used directly so the query box measures wide
-# characters in terminal cells rather than assuming one column each.
 unicode-width = "0.2"
-# Natural-language search talks to a local Ollama server over plain HTTP; no TLS
-# needed (localhost only), so drop ureq's default TLS/gzip features.
-ureq = { version = "2", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"
+bincode = { version = "2", features = ["serde"] }
+mime_guess = "2"
+infer = "0.19"
+content_inspector = "0.2"
+notify = "8"
+trash = "5"
+libc = "0.2"
+rayon = "1"
+ignore = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
+regex = "1"
+nucleo-matcher = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+fastrand = "2"
+# yazi-compatible Lua plugins. Vendored Lua 5.4, created only when a plugin
+# (or init.lua) is actually used, so it costs nothing at start-up.
+mlua = { version = "0.12", features = ["lua54", "vendored", "serde"] }
+# Remote filesystems (yazi's VFS, `sftp://`). Pure Rust; the async runtime is
+# only started when a remote is first used.
+
+[dev-dependencies]
+tempfile = "3"

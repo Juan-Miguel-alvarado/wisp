@@ -1,7 +1,7 @@
 //! Scale check: build a 100k-document in-memory index with a realistic
 //! vocabulary and measure query latency. Run with:
 //!
-//!     cargo run --release --example scale -p deepsearch-core
+//!     cargo run --release --example scale -p wisp-core
 //!
 //! This bypasses the filesystem (the indexer is benchmarked separately in
 //! `benches/bench.rs`) to isolate pure query latency at the target scale.
@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use deepsearch_core::index::{Index, PendingDoc};
-use deepsearch_core::query::{search, QueryOptions};
-use deepsearch_core::FileType;
+use wisp_core::index::{Index, PendingDoc};
+use wisp_core::query::{search, QueryOptions};
+use wisp_core::FileType;
 
 const DOCS: usize = 100_000;
 const VOCAB: usize = 8_000;

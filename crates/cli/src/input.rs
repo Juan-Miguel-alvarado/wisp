@@ -1,404 +1,522 @@
-//! A single-line text input with a cursor and horizontal scrolling.
+//! A single-line editor with vi modes, matching yazi's input layer.
 //!
-//! Split out from the UI because it is pure logic over a string: no terminal, no ratatui, no
-//! state beyond the text and the caret. That makes the fiddly parts — moving through multi-byte
-//! characters, deleting a word, keeping the caret visible in a query longer than the box — cheap
-//! to test exhaustively, which is exactly where an input box goes wrong.
-//!
-//! Positions are **character** indices, never byte offsets, so an accented letter behaves like
-//! any other. Widths are measured in **terminal cells**, so a CJK character that occupies two
-//! columns is accounted for when deciding what fits.
+//! Positions are **character** indices (never byte offsets), so multi-byte
+//! names edit naturally; widths are measured in terminal cells when deciding
+//! what fits in the box.
 
 use unicode_width::UnicodeWidthChar;
 
-/// What is currently visible in the box, and where to put the caret.
-#[derive(Debug, PartialEq, Eq)]
-pub struct View {
-    /// The slice of the query that fits.
-    pub text: String,
-    /// Caret offset from the start of `text`, in terminal cells.
-    pub cursor_col: usize,
-    /// Whether text is scrolled off the left edge.
-    pub scrolled: bool,
+use crate::keymap::Cmd;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Insert,
+    Visual,
+    Replace,
 }
 
-/// An editable line of text.
-#[derive(Debug, Default, Clone)]
-pub struct LineInput {
-    text: String,
-    /// Caret position as a character index in `0..=char_len`.
+#[derive(Clone, Debug)]
+struct Snap {
+    text: Vec<char>,
     cursor: usize,
 }
 
-impl LineInput {
-    pub fn new() -> Self {
-        Self::default()
+/// What a visible slice of the line looks like.
+pub struct View {
+    pub text: String,
+    pub cursor_col: usize,
+    /// Selected range within `text`, in cells.
+    pub selection: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Input {
+    text: Vec<char>,
+    cursor: usize,
+    pub mode: Mode,
+    anchor: Option<usize>,
+    offset: usize,
+    undo: Vec<Snap>,
+    redo: Vec<Snap>,
+    register: String,
+    /// When set, the text is obscured (not used for files, kept for parity).
+    pub obscure: bool,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self::new("", Mode::Insert)
+    }
+}
+
+/// Character classes for word motions.
+fn class(c: char, far: bool) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if far || c.is_alphanumeric() || c == '_' {
+        1
+    } else {
+        2
+    }
+}
+
+impl Input {
+    pub fn new(text: &str, mode: Mode) -> Self {
+        let text: Vec<char> = text.chars().collect();
+        let cursor = text.len();
+        Self {
+            text,
+            cursor,
+            mode,
+            anchor: None,
+            offset: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            register: String::new(),
+            obscure: false,
+        }
     }
 
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn value(&self) -> String {
+        self.text.iter().collect()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
-    }
-
-    /// Number of characters, which is also the caret's maximum position.
-    pub fn len(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    /// Only assertions need this today; the widget derives everything it draws from [`Self::view`].
     #[cfg(test)]
     pub fn cursor(&self) -> usize {
         self.cursor
     }
 
-    /// Byte offset of a character index, clamped to the end of the string.
-    fn byte_of(&self, char_index: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(char_index)
-            .map_or(self.text.len(), |(byte, _)| byte)
+    pub fn set_cursor(&mut self, c: usize) {
+        self.cursor = c.min(self.text.len());
+        self.clamp();
     }
 
-    // --- editing. Each returns whether the text changed, so the caller knows
-    // whether a new search is needed rather than guessing. ---
-
-    pub fn insert(&mut self, c: char) -> bool {
-        let at = self.byte_of(self.cursor);
-        self.text.insert(at, c);
-        self.cursor += 1;
-        true
+    pub fn set_value(&mut self, s: &str) {
+        self.snapshot();
+        self.text = s.chars().collect();
+        self.cursor = self.text.len();
+        self.clamp();
     }
 
-    pub fn insert_str(&mut self, s: &str) -> bool {
-        if s.is_empty() {
-            return false;
+    fn snapshot(&mut self) {
+        self.undo.push(Snap {
+            text: self.text.clone(),
+            cursor: self.cursor,
+        });
+        if self.undo.len() > 200 {
+            self.undo.remove(0);
         }
-        let at = self.byte_of(self.cursor);
-        self.text.insert_str(at, s);
-        self.cursor += s.chars().count();
-        true
+        self.redo.clear();
     }
 
-    /// Delete the character before the caret.
-    pub fn backspace(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
+    /// In normal/visual mode the cursor sits *on* a character, so it can't be
+    /// past the last one.
+    fn clamp(&mut self) {
+        let max = if self.mode == Mode::Insert {
+            self.text.len()
+        } else {
+            self.text.len().saturating_sub(1)
+        };
+        self.cursor = self.cursor.min(max);
+    }
+
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let a = self.anchor?;
+        let (s, e) = if a <= self.cursor {
+            (a, self.cursor)
+        } else {
+            (self.cursor, a)
+        };
+        Some((s, (e + 1).min(self.text.len())))
+    }
+
+    pub fn type_char(&mut self, c: char) {
+        match self.mode {
+            Mode::Insert => {
+                self.snapshot();
+                self.text.insert(self.cursor, c);
+                self.cursor += 1;
+            }
+            Mode::Replace => {
+                self.snapshot();
+                if self.cursor < self.text.len() {
+                    self.text[self.cursor] = c;
+                }
+                self.mode = Mode::Normal;
+            }
+            _ => {}
         }
-        self.cursor -= 1;
-        self.text.remove(self.byte_of(self.cursor));
-        true
     }
 
-    /// Delete the character under the caret.
-    pub fn delete(&mut self) -> bool {
-        if self.cursor >= self.len() {
-            return false;
+    pub fn type_str(&mut self, s: &str) {
+        if self.mode != Mode::Insert {
+            return;
         }
-        self.text.remove(self.byte_of(self.cursor));
-        true
-    }
-
-    /// Delete backwards to the start of the previous word, the way a shell does: skip any
-    /// whitespace immediately behind the caret, then the run of non-whitespace before it.
-    pub fn delete_word_back(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
+        self.snapshot();
+        for c in s.chars().filter(|c| !c.is_control()) {
+            self.text.insert(self.cursor, c);
+            self.cursor += 1;
         }
-        let chars: Vec<char> = self.text.chars().collect();
-        let mut start = self.cursor;
-        while start > 0 && chars[start - 1].is_whitespace() {
-            start -= 1;
+    }
+
+    fn word_back(&self, far: bool) -> usize {
+        let mut i = self.cursor;
+        while i > 0 && class(self.text[i - 1], far) == 0 {
+            i -= 1;
         }
-        while start > 0 && !chars[start - 1].is_whitespace() {
-            start -= 1;
+        if i == 0 {
+            return 0;
         }
-        let (from, to) = (self.byte_of(start), self.byte_of(self.cursor));
-        self.text.replace_range(from..to, "");
-        self.cursor = start;
-        true
-    }
-
-    /// Delete from the caret to the end of the line.
-    pub fn kill_to_end(&mut self) -> bool {
-        if self.cursor >= self.len() {
-            return false;
+        let k = class(self.text[i - 1], far);
+        while i > 0 && class(self.text[i - 1], far) == k {
+            i -= 1;
         }
-        let at = self.byte_of(self.cursor);
-        self.text.truncate(at);
-        true
+        i
     }
 
-    pub fn clear(&mut self) -> bool {
-        if self.text.is_empty() {
-            return false;
+    fn word_forward(&self, far: bool) -> usize {
+        let n = self.text.len();
+        let mut i = self.cursor;
+        if i >= n {
+            return n;
         }
-        self.text.clear();
-        self.cursor = 0;
-        true
-    }
-
-    /// Replace the whole line, leaving the caret at the end.
-    pub fn set(&mut self, text: impl Into<String>) {
-        self.text = text.into();
-        self.cursor = self.len();
-    }
-
-    // --- caret movement. These never change the text. ---
-
-    pub fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    pub fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.len());
-    }
-
-    pub fn home(&mut self) {
-        self.cursor = 0;
-    }
-
-    pub fn end(&mut self) {
-        self.cursor = self.len();
-    }
-
-    /// The portion of the line that fits in `width` cells, with the caret always visible.
-    ///
-    /// Scrolling is derived from the caret rather than remembered, so it cannot drift out of sync
-    /// with the text after an edit. When the caret sits past the right edge the window is
-    /// right-anchored to it; the caller is told when content is hidden to the left so it can show
-    /// a marker.
-    pub fn view(&self, width: usize) -> View {
-        if width == 0 {
-            return View {
-                text: String::new(),
-                cursor_col: 0,
-                scrolled: false,
-            };
+        let k = class(self.text[i], far);
+        while i < n && class(self.text[i], far) == k && k != 0 {
+            i += 1;
         }
+        while i < n && class(self.text[i], far) == 0 {
+            i += 1;
+        }
+        i
+    }
 
-        let chars: Vec<char> = self.text.chars().collect();
-        let cell_width = |c: char| c.width().unwrap_or(0);
-        // One cell is reserved so the caret itself has somewhere to sit at the end of the line.
-        let budget = width.saturating_sub(1).max(1);
+    fn word_end(&self, far: bool) -> usize {
+        let n = self.text.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut i = self.cursor + 1;
+        while i < n && class(self.text[i], far) == 0 {
+            i += 1;
+        }
+        if i >= n {
+            return n - 1;
+        }
+        let k = class(self.text[i], far);
+        while i + 1 < n && class(self.text[i + 1], far) == k {
+            i += 1;
+        }
+        i
+    }
 
-        // Walk back from the caret until the text between `start` and the caret fills the budget.
-        let mut start = self.cursor;
-        let mut used = 0usize;
-        while start > 0 {
-            let w = cell_width(chars[start - 1]);
-            if used + w > budget {
+    fn delete_range(&mut self, s: usize, e: usize, cut: bool) {
+        if s >= e {
+            return;
+        }
+        self.snapshot();
+        let removed: String = self.text.drain(s..e).collect();
+        if cut {
+            self.register = removed;
+        }
+        self.cursor = s;
+    }
+
+    /// Run an input-layer command. Returns `Some(submit)` when the input
+    /// should close (`true` = submit, `false` = cancel).
+    pub fn exec(&mut self, cmd: &Cmd) -> Option<bool> {
+        let (_, name) = cmd.layer();
+        match name {
+            "close" => return Some(cmd.flag("submit")),
+            "escape" => match self.mode {
+                Mode::Insert => {
+                    self.mode = Mode::Normal;
+                    self.cursor = self.cursor.saturating_sub(1);
+                    self.clamp();
+                }
+                Mode::Visual | Mode::Replace => {
+                    self.mode = Mode::Normal;
+                    self.anchor = None;
+                    self.clamp();
+                }
+                Mode::Normal => return Some(false),
+            },
+            "insert" => {
+                if self.mode == Mode::Visual {
+                    self.anchor = None;
+                }
+                let append = cmd.flag("append");
+                self.mode = Mode::Insert;
+                if append && !self.text.is_empty() {
+                    self.cursor = (self.cursor + 1).min(self.text.len());
+                }
+            }
+            "visual" => {
+                self.mode = Mode::Visual;
+                self.anchor = Some(self.cursor);
+            }
+            "replace" => {
+                if !self.text.is_empty() {
+                    self.mode = Mode::Replace;
+                }
+            }
+            "move" => {
+                let arg = cmd.arg(0).unwrap_or("0");
+                self.cursor = match arg {
+                    "bol" => 0,
+                    "eol" => self.text.len(),
+                    "first-char" => self
+                        .text
+                        .iter()
+                        .position(|c| !c.is_whitespace())
+                        .unwrap_or(0),
+                    n => {
+                        let d: isize = n.parse().unwrap_or(0);
+                        (self.cursor as isize + d).max(0) as usize
+                    }
+                };
+                self.clamp();
+            }
+            "backward" => {
+                self.cursor = self.word_back(cmd.flag("far"));
+                self.clamp();
+            }
+            "forward" => {
+                let far = cmd.flag("far");
+                self.cursor = if cmd.flag("end-of-word") {
+                    let e = self.word_end(far);
+                    if self.mode == Mode::Insert {
+                        (e + 1).min(self.text.len())
+                    } else {
+                        e
+                    }
+                } else {
+                    self.word_forward(far)
+                };
+                self.clamp();
+            }
+            "backspace" => {
+                if cmd.flag("under") {
+                    if self.cursor < self.text.len() {
+                        self.delete_range(self.cursor, self.cursor + 1, false);
+                    }
+                } else if self.cursor > 0 {
+                    self.delete_range(self.cursor - 1, self.cursor, false);
+                }
+                self.clamp();
+            }
+            "kill" => {
+                let (s, e) = match cmd.arg(0).unwrap_or("") {
+                    "bol" => (0, self.cursor),
+                    "eol" => (self.cursor, self.text.len()),
+                    "backward" => (self.word_back(false), self.cursor),
+                    "forward" => (self.cursor, self.word_forward(false)),
+                    _ => (self.cursor, self.cursor),
+                };
+                self.delete_range(s, e, true);
+                self.clamp();
+            }
+            "delete" => {
+                let (s, e) = match self.selection() {
+                    Some(r) => r,
+                    None if self.cursor < self.text.len() => (self.cursor, self.cursor + 1),
+                    None => (self.cursor, self.cursor),
+                };
+                self.delete_range(s, e, cmd.flag("cut"));
+                self.anchor = None;
+                self.mode = if cmd.flag("insert") {
+                    Mode::Insert
+                } else {
+                    Mode::Normal
+                };
+                self.clamp();
+            }
+            "yank" => {
+                if let Some((s, e)) = self.selection() {
+                    self.register = self.text[s..e].iter().collect();
+                    self.cursor = s;
+                }
+                self.anchor = None;
+                self.mode = Mode::Normal;
+                self.clamp();
+            }
+            "paste" => {
+                if self.register.is_empty() {
+                    return None;
+                }
+                self.snapshot();
+                let at = if cmd.flag("before") || self.text.is_empty() {
+                    self.cursor
+                } else {
+                    (self.cursor + 1).min(self.text.len())
+                };
+                let reg: Vec<char> = self.register.chars().collect();
+                let n = reg.len();
+                self.text.splice(at..at, reg);
+                self.cursor = at + n.saturating_sub(1);
+                self.clamp();
+            }
+            "undo" => {
+                if self.mode == Mode::Visual {
+                    return None;
+                }
+                if let Some(s) = self.undo.pop() {
+                    self.redo.push(Snap {
+                        text: std::mem::replace(&mut self.text, s.text),
+                        cursor: self.cursor,
+                    });
+                    self.cursor = s.cursor;
+                    self.clamp();
+                }
+            }
+            "redo" => {
+                if let Some(s) = self.redo.pop() {
+                    self.undo.push(Snap {
+                        text: std::mem::replace(&mut self.text, s.text),
+                        cursor: self.cursor,
+                    });
+                    self.cursor = s.cursor;
+                    self.clamp();
+                }
+            }
+            "casefy" => {
+                if let Some((s, e)) = self.selection() {
+                    self.snapshot();
+                    let upper = cmd.arg(0) == Some("upper");
+                    for c in &mut self.text[s..e] {
+                        *c = if upper {
+                            c.to_uppercase().next().unwrap_or(*c)
+                        } else {
+                            c.to_lowercase().next().unwrap_or(*c)
+                        };
+                    }
+                    self.anchor = None;
+                    self.mode = Mode::Normal;
+                    self.cursor = s;
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// The part of the line that fits in `width` cells, scrolled to keep the
+    /// cursor visible.
+    pub fn view(&mut self, width: usize) -> View {
+        let width = width.max(1);
+        let w = |c: &char| c.width().unwrap_or(0);
+        if self.cursor < self.offset {
+            self.offset = self.cursor;
+        }
+        loop {
+            let used: usize = self.text[self.offset..self.cursor].iter().map(w).sum();
+            if used < width || self.offset >= self.cursor {
                 break;
             }
-            used += w;
-            start -= 1;
+            self.offset += 1;
         }
-
-        let cursor_col = used;
         let mut text = String::new();
-        let mut taken = 0usize;
-        // Build the window forward from `start`, which is at most `width` cells wide and always
-        // contains the caret.
-        for &c in &chars[start..] {
-            let w = cell_width(c);
-            if taken + w > width {
+        let mut cells = 0;
+        let mut cursor_col = 0;
+        let sel = self.selection();
+        let mut sel_cells: Option<(usize, usize)> = None;
+        for (i, c) in self.text.iter().enumerate().skip(self.offset) {
+            let cw = w(c);
+            if cells + cw > width {
                 break;
             }
-            taken += w;
-            text.push(c);
+            if i == self.cursor {
+                cursor_col = cells;
+            }
+            if let Some((s, e)) = sel {
+                if i >= s && i < e {
+                    let r = sel_cells.get_or_insert((cells, cells));
+                    r.1 = cells + cw;
+                }
+            }
+            text.push(if self.obscure { '•' } else { *c });
+            cells += cw;
         }
-
+        if self.cursor >= self.text.len() {
+            cursor_col = cells;
+        }
         View {
             text,
             cursor_col,
-            scrolled: start > 0,
+            selection: sel_cells,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::LineInput;
+    use super::*;
 
-    fn input(text: &str) -> LineInput {
-        let mut input = LineInput::new();
-        input.set(text);
-        input
+    fn run(i: &mut Input, s: &str) -> Option<bool> {
+        i.exec(&Cmd::parse(s).unwrap())
     }
 
     #[test]
-    fn typing_inserts_at_the_caret_not_at_the_end() {
-        let mut line = input("helo");
-        line.home();
-        line.right();
-        line.right();
-        line.right();
-        assert!(line.insert('l'));
-        assert_eq!(line.text(), "hello");
-        assert_eq!(line.cursor(), 4);
+    fn insert_and_backspace() {
+        let mut i = Input::new("ab", Mode::Insert);
+        i.type_char('c');
+        assert_eq!(i.value(), "abc");
+        run(&mut i, "backspace");
+        assert_eq!(i.value(), "ab");
+        run(&mut i, "move bol");
+        run(&mut i, "backspace --under");
+        assert_eq!(i.value(), "b");
     }
 
     #[test]
-    fn backspace_and_delete_work_on_either_side_of_the_caret() {
-        let mut line = input("abcd");
-        line.home();
-        line.right();
-        line.right();
-        assert!(line.backspace());
-        assert_eq!(line.text(), "acd");
-        assert!(line.delete());
-        assert_eq!(line.text(), "ad");
-        assert_eq!(line.cursor(), 1);
+    fn word_motions_and_kill() {
+        let mut i = Input::new("foo bar.baz", Mode::Insert);
+        run(&mut i, "kill backward");
+        assert_eq!(i.value(), "foo bar.");
+        run(&mut i, "backward");
+        assert_eq!(i.cursor(), 7);
+        run(&mut i, "kill bol");
+        assert_eq!(i.value(), ".");
     }
 
     #[test]
-    fn deleting_past_either_edge_is_a_no_op_rather_than_a_panic() {
-        let mut line = LineInput::new();
-        assert!(!line.backspace());
-        assert!(!line.delete());
-        assert!(!line.kill_to_end());
-        assert!(!line.clear());
-
-        let mut line = input("x");
-        line.home();
-        assert!(!line.backspace());
-        line.end();
-        assert!(!line.delete());
+    fn escape_then_escape_cancels() {
+        let mut i = Input::new("x", Mode::Insert);
+        assert_eq!(run(&mut i, "escape"), None);
+        assert_eq!(i.mode, Mode::Normal);
+        assert_eq!(run(&mut i, "escape"), Some(false));
+        assert_eq!(run(&mut i, "close --submit"), Some(true));
     }
 
     #[test]
-    fn multi_byte_characters_are_one_step_each() {
-        // Every character here is multi-byte; byte-indexing would panic or corrupt the string.
-        let mut line = input("añoñ");
-        assert_eq!(
-            line.cursor(),
-            4,
-            "the caret counts characters, not the 6 bytes"
-        );
-
-        line.left(); // now between 'o' and the final 'ñ'
-        assert!(line.backspace());
-        assert_eq!(
-            line.text(),
-            "aññ",
-            "backspace removes the 'o', not half of a 'ñ'"
-        );
-
-        assert!(line.insert('é'));
-        assert_eq!(line.text(), "añéñ");
-        assert_eq!(line.cursor(), 3);
+    fn visual_yank_paste_undo() {
+        let mut i = Input::new("hello", Mode::Normal);
+        run(&mut i, "move bol");
+        run(&mut i, "visual");
+        run(&mut i, "move 1");
+        run(&mut i, "yank");
+        run(&mut i, "move eol");
+        run(&mut i, "paste");
+        assert_eq!(i.value(), "hellohe");
+        run(&mut i, "undo");
+        assert_eq!(i.value(), "hello");
+        run(&mut i, "redo");
+        assert_eq!(i.value(), "hellohe");
     }
 
     #[test]
-    fn word_delete_eats_the_word_and_the_space_behind_it() {
-        let mut line = input("hola que tal");
-        assert!(line.delete_word_back());
-        assert_eq!(line.text(), "hola que ");
-        assert!(line.delete_word_back());
-        assert_eq!(line.text(), "hola ");
-        assert!(line.delete_word_back());
-        assert_eq!(line.text(), "");
-        assert!(!line.delete_word_back());
+    fn view_scrolls() {
+        let mut i = Input::new("abcdefghij", Mode::Insert);
+        let v = i.view(5);
+        assert_eq!(v.cursor_col, 4);
+        assert!(v.text.ends_with('j'));
     }
 
     #[test]
-    fn word_delete_only_touches_text_behind_the_caret() {
-        let mut line = input("uno dos tres");
-        line.home();
-        for _ in 0..7 {
-            line.right();
-        }
-        assert!(line.delete_word_back());
-        assert_eq!(line.text(), "uno  tres");
-    }
-
-    #[test]
-    fn kill_to_end_keeps_what_is_behind_the_caret() {
-        let mut line = input("keep this drop that");
-        line.home();
-        for _ in 0..10 {
-            line.right();
-        }
-        assert!(line.kill_to_end());
-        assert_eq!(line.text(), "keep this ");
-    }
-
-    #[test]
-    fn caret_movement_is_clamped_to_the_line() {
-        let mut line = input("ab");
-        line.end();
-        line.right();
-        line.right();
-        assert_eq!(line.cursor(), 2);
-        line.home();
-        line.left();
-        assert_eq!(line.cursor(), 0);
-    }
-
-    #[test]
-    fn a_short_line_is_shown_whole() {
-        let line = input("hello");
-        let view = line.view(40);
-        assert_eq!(view.text, "hello");
-        assert_eq!(view.cursor_col, 5);
-        assert!(!view.scrolled);
-    }
-
-    #[test]
-    fn a_long_line_scrolls_to_keep_the_caret_visible() {
-        let line = input(&"abcdefghij".repeat(5)); // 50 characters
-        let view = line.view(10);
-        assert!(view.scrolled, "content is hidden to the left");
-        assert!(view.text.chars().count() <= 10);
-        assert!(view.cursor_col < 10, "the caret must stay inside the box");
-        assert!(
-            line.text().ends_with(&view.text),
-            "the window is anchored to the caret"
-        );
-    }
-
-    #[test]
-    fn scrolling_back_to_the_start_stops_scrolling() {
-        let mut line = input(&"x".repeat(50));
-        line.home();
-        let view = line.view(10);
-        assert!(!view.scrolled);
-        assert_eq!(view.cursor_col, 0);
-        assert!(view.text.starts_with('x'));
-    }
-
-    #[test]
-    fn wide_characters_are_measured_in_cells_not_characters() {
-        // Each of these occupies two terminal columns.
-        let line = input("日本語テキスト");
-        let view = line.view(10);
-        let cells: usize = view
-            .text
-            .chars()
-            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
-            .sum();
-        assert!(
-            cells <= 10,
-            "the window must not overflow the box: {cells} cells"
-        );
-        assert!(view.cursor_col <= 10);
-    }
-
-    #[test]
-    fn a_zero_width_box_does_not_panic() {
-        let line = input("anything");
-        let view = line.view(0);
-        assert!(view.text.is_empty());
-        assert_eq!(view.cursor_col, 0);
-    }
-
-    #[test]
-    fn set_moves_the_caret_to_the_end() {
-        let mut line = input("short");
-        line.home();
-        line.set("a much longer replacement");
-        assert_eq!(line.cursor(), line.len());
+    fn multibyte() {
+        let mut i = Input::new("añb", Mode::Insert);
+        run(&mut i, "backspace");
+        run(&mut i, "backspace");
+        assert_eq!(i.value(), "a");
     }
 }

@@ -1,616 +1,319 @@
-# deepsearch
+# Wisp
 
 [![Release](https://img.shields.io/github/v/release/Juan-Miguel-alvarado/Deepsearch?sort=semver)](https://github.com/Juan-Miguel-alvarado/Deepsearch/releases/latest)
 
-Relevance-ranked full-text search over **all** your files, from the terminal.
+A terminal file manager with [yazi](https://github.com/sxyazi/yazi)'s UI, keymap
+and config format — **several times faster to start, far lighter on memory, and
+an order of magnitude faster on huge directories** — plus deep full-text search
+inside your documents (PDF, DOCX, code, text).
 
-
-
-`deepsearch` is not `find` or `grep`. It scans your filesystem **once**, builds a
-persistent inverted index, and then answers queries in **sub-millisecond** time,
-ranked by **BM25 relevance** over both file *names* and file *contents*.
-
-- **Ranked search that keeps up with you** — prefix matching as you type, typo
-  tolerance, and `type:`/`ext:` filters. Folders are indexed too, so you can find
-  a directory and not just the files inside it.
-- **A TUI built for browsing** — live syntax-highlighted previews (images render
-  through the terminal's graphics protocol), an **open-with** menu that launches
-  a file in whatever app you actually have installed, and one-key copy-path.
-- **Optional local AI**, via [Ollama](https://ollama.com) — free, offline, no API
-  keys. **Semantic search** finds files by meaning rather than by keyword, and
-  **`ask`** answers questions from what's inside your files, citing its sources.
+If you know yazi you already know Wisp: same three-column layout, same
+keys, same popups, and it reads your existing `~/.config/yazi/` theme, keymap
+and openers as they are.
 
 ```
-deepsearch index ~/projects           # scan & index once (incremental afterwards)
-deepsearch query "bm25 ranking"       # ranked results, name + content
-deepsearch ask "how does auth work?"  # an answer from your files, with sources
-deepsearch                            # the interactive TUI
+wisp            # open the file manager in the current directory
+wisp ~/photos   # …or somewhere else (pass a file to reveal it)
 ```
 
 ---
 
-![deepsearch: a typo still finds the file, the caret walks back to fix it, and the results sharpen](docs/demo.gif)
+## How much faster
 
-<sub>Typed with a typo on purpose — fuzzy filename matching finds `porcelain.rs` anyway; the
-caret steps back into the word, the missing letter goes in, and the ranking sharpens from one
-result to five. Generated from the real TUI, not a screen recording (see
-[Development](#development)).</sub>
+Measured on the same machine against yazi 26.5.6, both reading the same user
+config, in a 160×40 pseudo-terminal. "First paint" is the time from launching
+the program until the directory listing is on screen
+([`scripts/bench.py`](scripts/bench.py); medians of 5–30 runs each).
 
+| | Wisp | yazi | |
+|---|---:|---:|---:|
+| First paint, small directory (50 files) | **7.8 ms** | 47.4 ms | **6.1× faster** |
+| First paint, `/usr/bin` (2,988 entries) | **13.0 ms** | 80.2 ms | **6.2× faster** |
+| First paint, 100 000 files | **113 ms** | 1,759 ms | **15× faster** |
+| Jump to the last of 100 000 files (`G`) | **8.9 ms** | 104 ms | **12× faster** |
+| Memory after first paint, small directory | **8.2 MiB** | 59.8 MiB | **7.3× less** |
+| Memory after first paint, `/usr/bin` | **9.5 MiB** | 88.0 MiB | **9.3× less** |
+| Memory with 100 000 files listed | **48 MiB** | 164 MiB | **3.4× less** |
 
+<sub>The pseudo-terminal harness itself adds ~3.6 ms (that is how long a
+program that only prints the expected text takes to "paint"), so the real
+difference you feel is larger than the ratios above. Reproduce with
+`python3 scripts/bench.py --dir <dir> --marker <a-file-name> -- <program>`.</sub>
 
+Where the speed comes from:
 
+- **No interpreter at start-up.** yazi boots a Lua runtime and parses its TOML
+  presets on every launch. Wisp compiles config, theme and keymap once,
+  caches the result in a compact binary form (invalidated whenever any of the
+  source files change), and decodes it on a helper thread while the terminal is
+  being set up and the starting directory is read on another.
+- **One pass over the directory.** Names and `statx` data are read together and
+  fanned out across cores for large directories; sorting is parallel; only the
+  visible rows are ever rendered.
+- **No process per file.** MIME types come from the extension (a table lookup);
+  content sniffing runs only for files without a known extension, off the UI
+  thread. yazi spawns `file(1)` for this.
+- **In-process search.** `s`/`S` use the same libraries as `fd` and ripgrep, but
+  without spawning them — and they work even when neither is installed.
+- **Idle means idle.** The UI thread blocks on a single event channel and only
+  repaints when something changed; previews are built off-thread with an LRU and
+  neighbour prefetching, so moving the cursor back and forth is instant.
 
----
+## Everything yazi does
+
+- **Layout & look** — parent / current / preview columns with yazi's ratios,
+  header with cwd and selection/yank counters, tab bar, status bar with mode,
+  size, name, permissions, position and task progress. Rounded popups in the
+  same places, same nerd-font icon table and filetype colours.
+- **Navigation** — `hjkl`/arrows, half/full pages, `gg`/`G`, back/forward
+  history (`H`/`L`), `cd` with path completion (`g<Space>`), `gh` `gc` `gd`,
+  follow symlinks (`gf`), the cursor remembered per directory, `scrolloff`.
+- **Selection** — `<Space>`, `<C-a>`, `<C-r>`, visual select/unset modes
+  (`v`/`V`), markers in the left gutter.
+- **File operations** — yank/cut/paste (`y` `x` `p` `P`), symlinks absolute and
+  relative (`-` `_`), hardlinks (`<C-->`), trash (`d`) and permanent delete (`D`)
+  with confirmation, create files/directories (`a`, trailing `/` for a dir),
+  rename with the cursor before the extension (`r`), **bulk rename in `$EDITOR`**
+  when several files are selected, archive extraction. All copies/moves run as
+  background tasks with progress, cancellable from the task manager (`w`).
+  Yanks are shared between running instances, like yazi.
+- **Opening** — yazi's `[opener]`/`[open]` rules, the "Open with" picker (`O`),
+  blocking openers that hand over the terminal (`$EDITOR`), orphaned GUI apps.
+- **Shell** — `;` and `:` with `$0`/`$@` and yazi's `%s`/`%s1`/`%d`/`%h`
+  placeholders.
+- **Find, filter, search** — incremental find with `n`/`N` and `[i/n]`
+  counters (`/`, `?`), live filter (`f`), recursive search by name (`s`) and by
+  content (`S`), cancel with `<C-s>`.
+- **Previews** — syntax-highlighted code, images (Kitty, Sixel, iTerm2 or
+  half-blocks), video thumbnails, PDF pages, SVG/HEIC/AVIF/JXL, fonts, archive
+  listings, `file(1)` descriptions for the rest; scroll them with `J`/`K`.
+- **Spot** (`<Tab>`) — yazi's table (Folder/Image/Video, Base, Plugins
+  sections), with copy-a-cell and swipe between files.
+- **Sorting & linemodes** — `,m` `,b` `,e` `,a` `,n` `,s` `,r` (and reversed),
+  `ms` `mp` `mb` `mm` `mo` `mn`; hidden files (`.`); copy path / dir / name
+  (`cc` `cd` `cf` `cn`, via `wl-copy`/`xclip`/OSC 52).
+- **Tabs** — `tt`, `tr`, `1`–`9`, `[` `]`, `{` `}`, `<C-c>`.
+- **Plugins** — yazi's Lua plugins and `init.lua`, `ya pkg`-style package
+  management (`wisp pkg`), `ya emit`-style remote commands
+  (`wisp emit`), `[plugin] previewers` rules including `piper`.
+  See [Plugins](#plugins).
+- **Everything else** — which-key popup for chords, help with filter (`~`),
+  notifications, mouse (click, right-click to open, scroll), live directory
+  watching, `<C-z>` suspend, `--cwd-file`, `--chooser-file` (file-picker mode),
+  `fzf` (`z`) and `zoxide` (`Z`) jumps.
+
+## …and more
+
+| | |
+|---|---|
+| **Deep search** (`F`) | Ranked full-text search *inside* PDFs, Word documents, code and text, from a persistent index (`wisp index`). Typo-tolerant, BM25-ranked, sub-millisecond queries. |
+| **Directory sizes** (`=`) | Total size of the hovered/selected directories, computed in parallel and shown in the size linemode and status bar. |
+| **Maximize preview** (`T`) | Toggle a full-width preview (yazi needs a plugin for this). |
+| **Richer spot** | An extra *Details* section: size in bytes, accessed time, octal mode, owner, links, inode, line count, symlink target with broken-link detection. |
+| **Find counter while typing** | `[i/n]` updates live as you type the pattern. |
+| **No helper tools required** | Search, MIME detection and archive listing for zip work without `fd`, `rg`, `file` or `7z`. |
 
 ## Installation
 
-Pick whichever fits you. After installing, run `deepsearch` from anywhere.
-
-### 1. Download a prebuilt binary (no Rust needed)
+### Prebuilt binary
 
 Grab the archive for your platform from the
-[**latest release**](https://github.com/Juan-Miguel-alvarado/Deepsearch/releases/latest),
-extract it, and put the `deepsearch` binary on your `PATH`.
-
-**Linux / macOS:**
+[latest release](https://github.com/Juan-Miguel-alvarado/Deepsearch/releases/latest),
+extract it and put `wisp` on your `PATH`:
 
 ```bash
-# pick the file matching your platform from the releases page, e.g.:
-#   deepsearch-x86_64-unknown-linux-gnu.tar.gz   (Linux, Intel/AMD)
-#   deepsearch-aarch64-apple-darwin.tar.gz       (macOS, Apple Silicon)
-#   deepsearch-x86_64-apple-darwin.tar.gz        (macOS, Intel)
-tar -xzf deepsearch-*.tar.gz
-sudo mv deepsearch /usr/local/bin/     # or: mv deepsearch ~/.local/bin/
-deepsearch --version
+tar -xzf wisp-x86_64-unknown-linux-gnu.tar.gz
+install -m 755 wisp ~/.local/bin/
 ```
 
-**Windows:** download `deepsearch-x86_64-pc-windows-msvc.zip`, unzip it, and put
-`deepsearch.exe` in a folder that's on your `PATH`.
-
-Each archive ships a `.sha256` file so you can verify the download
-(`shasum -a 256 -c deepsearch-*.tar.gz.sha256`).
-
-### 2. Install with Cargo (from source, needs [Rust](https://rustup.rs))
+### From source
 
 ```bash
-cargo install --git https://github.com/Juan-Miguel-alvarado/Deepsearch deepsearch
+cargo install --git https://github.com/Juan-Miguel-alvarado/Deepsearch wisp
+# or, from a clone:
+cargo build --release && cp target/release/wisp ~/.local/bin/
 ```
 
-This builds and drops `deepsearch` into `~/.cargo/bin` (already on your `PATH`
-if you use rustup). Re-run the same command to update.
+A [Nerd Font](https://www.nerdfonts.com) is needed for icons, as with yazi.
+Optional tools for richer previews: `ffmpegthumbnailer` (video), `pdftoppm`
+(PDF), `magick` (SVG/HEIC/AVIF/JXL/fonts), `bsdtar` or `7z` (non-zip archives),
+`file`, `fzf`, `zoxide`. `wisp --debug` shows which are found and where
+your config is read from.
 
-### 3. Build from a local clone
+### Change directory on exit
+
+The same wrapper as yazi's: quit with `q` and your shell lands where you were.
 
 ```bash
-git clone https://github.com/Juan-Miguel-alvarado/Deepsearch
-cd Deepsearch
-cargo install --path crates/cli --force
-```
-
----
-
-## Quickstart
-
-Try it on one folder first — indexing your whole home directory can wait.
-`--cache` keeps this trial index separate from your real one, so nothing you do
-here affects it:
-
-```bash
-# index a single folder into a throwaway cache
-deepsearch --cache /tmp/ds-demo.bin index ~/Documents
-
-# one-shot query from the shell
-deepsearch --cache /tmp/ds-demo.bin query "invoice"
-
-# or the interactive UI
-deepsearch --cache /tmp/ds-demo.bin tui
-```
-
-Things to try inside the TUI:
-
-- **Type a partial word** (`conf`) — results filter as you type, before you
-  finish `config`.
-- **Filter** with `ext:rs parser`, `type:image`, or `type:dir` to find a folder.
-- Press **`Enter`** to open a file in the right app for its type (text in your
-  editor, an image in an image viewer, a PDF in a PDF reader…).
-- Press **`o`** for the **open-with menu** and hit a number to launch instantly.
-- Press **`y`** to **copy the file's path**, and **`F1`** for the key help.
-
-When you're ready for the real thing, run `deepsearch` with no arguments: it
-indexes your home directory the first time (incrementally after that), then
-opens the UI.
-
----
-
-## Usage
-
-```
-deepsearch index [PATH]            Build the index (PATH defaults to $HOME).
-deepsearch index [PATH] --incremental
-                                   Reindex only changed files; drop deleted ones.
-deepsearch index [PATH] --semantic Also build semantic embeddings (see below).
-deepsearch query "<words>"         Ranked results (name + content).
-        --limit N                  Cap results (default 20).
-        --keyword                  Force keyword-only (skip semantic).
-        --json                     Machine-readable output.
-deepsearch ask "<plain text>"      Natural-language search (needs local Ollama).
-deepsearch tui [PATH]              Interactive UI (indexes PATH first if empty).
-deepsearch stats                   Index size, term counts, tombstone ratio.
-        --cache <FILE>             Use a non-default index location (global flag).
-```
-
-### Ask questions about your files (optional, local & free)
-
-With [Ollama](https://ollama.com) running locally, `ask` doesn't just find files
-— it **answers**, from what's actually inside them, and cites the sources:
-
-```bash
-deepsearch ask "how are passwords handled in my projects?"
-```
-```
-reading 3 file(s)…
-
-The password is typed as a text input, but it can be switched to display the
-password by clicking a button. The password itself is not stored anywhere in
-this excerpt. [3]
-
-Sources:
-  [1] ~/development/flutter/docs/.../Gradle-for-Android.md
-  [2] ~/Documents/proyects/.../ChangePasswordForm.tsx
-  [3] ~/Documents/proyects/.../password-input.tsx
-```
-
-It's retrieval-augmented generation over your own index: the question finds the
-most relevant documents (semantically when embeddings exist), deepsearch pulls
-the **passage that bears on the question** out of each one — not the file's
-imports — and a local model answers from those excerpts only, saying so plainly
-when they don't contain the answer. Nothing leaves the machine.
-
-`--json` emits `{ "answer": ..., "sources": [...] }` for scripting.
-
-**Speed.** This is the one slow feature: on a CPU-only machine expect roughly a
-minute per question (context length dominates, which is why only a few short
-excerpts are sent). A smaller model is markedly faster:
-
-```bash
-ollama pull llama3.2:1b
-export DEEPSEARCH_OLLAMA_MODEL=llama3.2:1b
-```
-
-It's entirely optional: with no Ollama installed, `ask` prints a friendly hint
-and everything else works exactly the same. deepsearch picks a locally installed
-model that can generate text (or set `DEEPSEARCH_OLLAMA_MODEL`); point at a
-non-default server with `OLLAMA_HOST`.
-
-### Semantic search (search by meaning)
-
-Keyword search only finds the words you type. **Semantic search** finds files by
-*meaning*, so a search for `login` surfaces a document about "authentication,
-credentials and session tokens" even though it never contains the word "login".
-
-Build it once (needs a local embedding model — free, offline):
-
-```bash
-ollama pull nomic-embed-text
-deepsearch index --semantic          # embeds every document (a one-time pass)
-```
-
-After that it just works:
-
-- `deepsearch query "login"` automatically blends keyword + semantic ranking
-  (add `--keyword` to force the old behaviour).
-- In the **TUI**, keyword results appear instantly and are re-ranked by meaning a
-  moment later; a green **`semantic`** tag in the search box shows it's active.
-
-How it works: each document is embedded into a vector with the local model; a
-query is embedded the same way and scored by cosine similarity, then blended with
-BM25 (`(1 − w)·keyword + w·semantic`, `w = 0.5`). Everything runs locally through
-Ollama — nothing leaves the machine. Pick a different embedding model with
-`DEEPSEARCH_OLLAMA_EMBED_MODEL`.
-
-> **Note:** enabling embeddings bumps the on-disk index format. After upgrading,
-> run `deepsearch index` again to rebuild the cache.
-
-### Search filters
-
-Any query — from the shell or in the TUI — can carry inline filters that narrow
-results by file type or extension. They combine with search terms, and a filter
-on its own browses the corpus (newest first):
-
-| Filter | Matches |
-|--------|---------|
-| `type:image` (`img`) | images |
-| `type:pdf` | PDFs |
-| `type:code` / `type:text` | source / plain text |
-| `type:docx` (`doc`) | Word documents |
-| `type:binary` (`bin`) | other binaries |
-| `type:dir` (`folder`) | **folders** |
-| `ext:rs`, `ext:.md` | files with that extension (dot optional) |
-
-```
-deepsearch query "parser ext:rs"     # 'parser' in .rs files only
-deepsearch query "invoice type:pdf"  # 'invoice' among PDFs
-deepsearch query "type:image"        # every image, most recent first
-deepsearch query "invoices type:dir"  # find the folder, not the files in it
-```
-
-### TUI keys
-
-**Editing the query** — the box is a proper line editor, with the keys your shell
-already gave you:
-
-| Key | Action |
-|-----|--------|
-| type | edit the query (incremental, debounced) |
-| `←`/`→`, `Home`/`End` | move the caret inside the query |
-| `Backspace` / `Delete` | delete behind / under the caret |
-| `Ctrl-w`, `Alt-Backspace` | delete the word behind the caret |
-| `Ctrl-k` | delete from the caret to the end |
-| `Ctrl-u` | clear the query |
-| paste | lands at the caret; newlines collapse to spaces |
-
-**Moving and opening:**
-
-| Key | Action |
-|-----|--------|
-| `↑`/`↓`, `Ctrl-n`/`Ctrl-p` | move selection |
-| `PageUp`/`PageDown` | move by one screenful of *your* terminal |
-| `Esc` | switch to Normal mode |
-| `j`/`k`, `g`/`G` | move / jump (Normal mode) |
-| `i` or `/` | back to Insert mode |
-| `Enter` | **open** the file in the right app for its type (see below) |
-| `o` (Normal) / `Ctrl-o` | **open with…** — a clean, numbered menu of installed apps |
-| `Ctrl-a` | **ask AI** — rewrite the query in plain language (needs local Ollama) |
-| `y` (Normal) / `Ctrl-y` | **copy** the selected file's path to the clipboard |
-| `F1` (any mode) / `?` (Normal) | show a **help overlay** listing every key |
-| `q` / `Esc` (Normal), `Ctrl-c` | quit |
-
-Two modes exist so the vim keys (`j`/`k`) can coexist with typing letters into the
-query box. Press `F1` any time (or `?` in Normal mode) for the full key list.
-`Ctrl-c` quits from anywhere, including with an overlay up.
-
-A query longer than the box scrolls sideways with the caret and marks the hidden
-text with `‹`, so what you typed never silently runs off the edge.
-
-**Smart open (`Enter`).** Opening does the sensible thing for the file type:
-text and source open in your `$EDITOR`, but an image opens in an image viewer, a
-PDF in a PDF reader, a video in a media player, and a Word doc / other file in
-the OS default handler — so you never get an image dumped as garbled text in the
-editor again.
-
-**Open-with menu (`o`).** A tidy popup that detects the applications actually
-installed on your `PATH` and orders them by relevance to the selected file
-(image viewers for an image, PDF readers for a PDF, …), then the OS default
-handler, then **Reveal in folder** and **Terminal here**. Press the number next
-to an entry to launch it instantly, or move with `↑`/`↓` and press `Enter`.
-Terminal apps (vim, helix, …) suspend the UI while they run; GUI apps launch
-detached so the search stays open.
-
----
-
-## Architecture
-
-Three layers, with a hard boundary between the engine and the UI:
-
-```
-┌────────────────────────────────────────────────┐
-│  crates/cli   deepsearch (binary)              │
-│    · clap CLI (index / query / ask / stats)    │
-│    · ratatui TUI + preview and AI workers      │
-└──────────────────────▲─────────────────────────┘
-                       │ public API only
-┌──────────────────────┴─────────────────────────┐
-│  crates/core  deepsearch-core (library)        │
-│    1. Indexer — walk, extract, build index     │
-│    2. Query   — BM25 + prefix/fuzzy + semantic │
-│    (usable with no TUI, no CLI)                │
-└────────────────────────────────────────────────┘
-```
-
-Layers 1 and 2 live in `deepsearch-core`, a standalone library with a public
-API ([`DeepSearch`], [`indexer`], [`query`]). The TUI depends on the library; the
-library depends on nothing UI-related. You can embed the engine in any program:
-
-```rust
-use deepsearch_core::{DeepSearch, IndexOptions, Progress, QueryOptions};
-
-let mut ds = DeepSearch::open_or_empty(None)?;
-ds.build("/home/juan".as_ref(), &IndexOptions::default(), &Progress::default());
-ds.save(None)?;
-for hit in ds.search("inverted index", &QueryOptions::default()) {
-    println!("{:.3}  {}", hit.score, hit.path.display());
+# bash / zsh
+function d() {
+	local tmp="$(mktemp -t "wisp-cwd.XXXXXX")" cwd
+	wisp "$@" --cwd-file="$tmp"
+	IFS= read -r -d '' cwd < "$tmp"
+	[ -n "$cwd" ] && [ "$cwd" != "$PWD" ] && builtin cd -- "$cwd"
+	rm -f -- "$tmp"
 }
 ```
 
----
-
-## Design decisions (and why)
-
-### Two-crate workspace, engine separated from UI
-A required constraint, and a good one: the engine is testable and reusable
-without a terminal. The binary is a thin shell over the library's public API.
-
-### Content-based file typing, not by extension
-Type detection reads magic bytes ([`infer`]) and, failing that, inspects the
-byte stream ([`content_inspector`]) to classify text vs binary. A `.txt` full of
-NUL bytes is treated as binary; a code file with no extension is still indexed.
-Extraction is per-type: plain text/code read directly, **PDF** via `pdf-extract`,
-**DOCX** by unzipping and pulling `<w:t>` runs out of `word/document.xml`,
-everything else indexed by **metadata only**.
-
-### Inverted index with two fields (content + name)
-`term → [(doc_id, term_freq)]`, kept as **two** separate dictionaries — one over
-contents, one over filenames. Keeping them apart is what lets the ranker boost a
-name match independently of a body match (configurable `name_boost`, default
-3×). Per-document metadata (path, size, mtime, token lengths) is held resident
-for ranking and display.
-
-### BM25, implemented by hand
-No search-engine crate. The classic Okapi BM25 with `k1 = 1.2`, `b = 0.75`:
-
-```
-idf(t)     = ln(1 + (N − df + 0.5) / (df + 0.5))
-score(t,d) = idf(t) · tf·(k1+1) / (tf + k1·(1 − b + b·|d|/avgdl))
+```fish
+function d
+	set tmp (mktemp -t "wisp-cwd.XXXXXX")
+	wisp $argv --cwd-file="$tmp"
+	if read -z cwd < "$tmp"; and [ -n "$cwd" ]; and [ "$cwd" != "$PWD" ]
+		builtin cd -- "$cwd"
+	end
+	rm -f -- "$tmp"
+end
 ```
 
-Document-frequency `df` is computed from **live** postings only (see tombstones
-below), so incremental churn never skews `idf`. Name-field scores are multiplied
-by `name_boost` and added to content scores.
+## Configuration
 
-### Tokenizer: normalize, then stem — but fuzzy uses the *un*stemmed form
-The pipeline splits on non-alphanumerics, splits `camelCase`/`snake_case` and
-letter↔digit boundaries (`getUserName → get user name`, `HTTPServer → http
-server`), lowercases, then applies English Snowball stemming. The **same**
-pipeline runs at index and query time so terms always align.
+Wisp uses yazi's file format. For each of `yazi.toml`, `keymap.toml` and
+`theme.toml` it uses the first one found in:
 
-Fuzzy filename matching deliberately runs on the **unstemmed** tokens. Stemming a
-*misspelled* word is unpredictable (`deployment → deploy`, but `deployemnt →
-deployemnt`), which would inflate the edit distance and defeat the whole point.
-So the index keeps a second, unstemmed filename dictionary purely for fuzzy
-lookups.
+1. `$WISP_CONFIG_HOME` or `~/.config/wisp/`
+2. `$YAZI_CONFIG_HOME` or `~/.config/yazi/`
 
-### Prefix matching: filter as you type
-An interactive search has to show useful results *before* you finish a word.
-When a query token isn't an exact filename term, it is treated as a **strict
-prefix** of the filename dictionary — so `conf` already surfaces `config.rs` and
-`configuration.rs`. Prefix hits score below an exact match but above a fuzzy one
-(`name_boost · prefix_penalty`, weighted by how much of the candidate word the
-prefix covers), so completing the word only sharpens the ranking rather than
-changing which files appear. The three name-field passes form a fallback chain —
-**exact → prefix → fuzzy** — and each stops the next, so the common case never
-pays for the approximate ones. Prefix matching runs on the same unstemmed
-filename dictionary as fuzzy, for the same reason (a half-typed word has no
-meaningful stem).
+so an existing yazi setup works unchanged, and you can override single files for
+Wisp only. Everything layers over yazi's defaults exactly like in yazi:
+tables merge, arrays replace, and `prepend_*` / `append_*` add around the
+defaults (e.g. `[mgr] prepend_keymap = [...]`). Flavors
+(`[flavor] dark = "…"` → `flavors/<name>.yazi/flavor.toml` + `tmtheme.xml`)
+are supported.
 
-### Fuzzy matching: Damerau-Levenshtein, bounded
-Typos are matched against real filename words with **Damerau-Levenshtein**
-distance (default ≤ 1), so a single adjacent transposition — the most common typo
-— counts as one edit (`gorceries → groceries`). A naive scan of a 100k-term
-dictionary would blow the latency budget, so two cheap prefilters run before the
-edit-distance: candidate length within the budget, and **matching first
-character**. The first-char filter alone prunes an entire numeric filename
-dictionary against a word query and keeps the scan bounded.
-*Trade-off:* a typo in the very first character won't fuzzy-match. In practice
-that is rare, and it is what buys the latency guarantee.
+Supported from `yazi.toml`: `[mgr]` (`ratio`, `sort_*`, `linemode`,
+`show_hidden`, `show_symlink`, `scrolloff`, `mouse_events`, `title_format`),
+`[preview]` (`tab_size`, `max_width`, `max_height`, `image_quality`),
+`[opener]`, `[open]` rules, and the `[input]`/`[confirm]`/`[pick]` titles.
+Every yazi command in `keymap.toml` works, with its flags, in every layer.
 
-### Incremental indexing via tombstones + compaction
-Re-indexing uses `mtime` to skip unchanged files. When a file changes or is
-deleted, its old `doc_id` is **tombstoned** (marked dead) rather than surgically
-removed from every postings list — surgical removal is O(dictionary) per file.
-Dead docs are skipped at query time and excluded from BM25 stats, so results stay
-correct. When the tombstone ratio crosses 30 %, a `compact()` pass renumbers ids
-and drops the dead weight. This keeps the *common* case (a few changed files)
-cheap while bounding worst-case bloat.
+## Plugins
 
-### Streaming, parallel indexing (bounded memory)
-Walking uses [`ignore`], so `.gitignore`/`.ignore`, hidden files, `node_modules`,
-`.git`, etc. are respected for free. Files are tokenized in **parallel** with
-`rayon`, but in **batches** of 512: each batch is tokenized, merged into the
-index, and dropped before the next. Only a batch's worth of tokenized documents
-is ever resident, so a tree of 100k+ files does not balloon memory.
+yazi's Lua plugins work. Put them where yazi does —
+`plugins/<name>.yazi/main.lua` under `~/.config/wisp/` or
+`~/.config/yazi/` — or install them like `ya pkg`:
 
-### Persistence: versioned bincode, atomic write
-The index serializes to `~/.cache/deepsearch/index.bin` with `bincode`, wrapped
-in a small envelope carrying a **format version** (a stale cache is rejected, not
-misread). Writes go to a temp file and are `rename`d into place, so a crash mid-save
-never corrupts the existing index.
-
-### Previews never block the UI
-The TUI runs a dedicated **preview worker thread**. Each request carries a
-generation number; the worker coalesces to the newest pending request and the UI
-applies a reply only if its generation still matches the current selection —
-stale work is discarded. Text/code is highlighted with `syntect` and query
-matches are overlaid (reversed+bold); PDFs/DOCX show extracted text; binaries
-show metadata. **Image decoding also happens on the worker** (decoded and
-downscaled there); the UI thread only wraps the result in the terminal-graphics
-widget.
-
-### The query box is a real line editor, and it lives outside the UI
-
-A search box you can only append to is the kind of thing you stop noticing and
-start resenting: spot a typo four words back and your only move is to delete the
-rest of the query. So the caret moves, `Ctrl-w` eats a word, paste lands where the
-caret is.
-
-The logic sits in its own module (`crates/cli/src/input.rs`) with no terminal and
-no ratatui in sight — it is pure functions over a string and a caret position.
-That is where an input box actually goes wrong: stepping over a multi-byte
-character, deleting a word at the start of the line, keeping the caret visible in a
-query longer than the box. Isolated, each of those is a three-line test instead of
-a manual poke at a running UI.
-
-Two distinctions are load-bearing. Positions are **character** indices, never byte
-offsets, so `año` is three steps and backspace never splits a character in half.
-Widths are measured in **terminal cells**, so a CJK character that occupies two
-columns is counted as two — otherwise the caret drifts to roughly twice the text's
-real width and lands on the border. Horizontal scrolling is *derived* from the
-caret rather than remembered, so it cannot fall out of sync with the text after an
-edit; a `‹` marks content hidden to the left, because a box that silently truncates
-looks like a box that lost your query.
-
-### The UI is idle when you are
-
-The screen is repainted only when something actually changed — a key, a finished
-preview, an AI reply, a terminal resize. Waiting for input is a blocking poll that
-costs nothing; repainting on every tick meant waking the CPU 25 times a second to
-draw an identical screen. For a tool that sits open in a terminal all day that is
-real battery for no benefit.
-
-The cost of doing this is that every state change must now *say* it changed —
-including terminal resizes, which the old unconditional redraw was quietly
-papering over. Each background channel therefore reports whether it applied
-anything, rather than the loop assuming the worst.
-
-### Empty panes have to say why they are empty
-
-A blank pane is ambiguous: no results, still working, or broken? All three look
-identical. So the results pane explains itself — before you type it says how many
-documents are indexed and points at the `ext:` and `type:` filters; with no
-matches it says so and suggests what to try. The preview pane says what it is
-waiting for instead of showing an ellipsis that never resolves.
-
-### Images: native protocols, no system dependency
-`ratatui-image` renders via Kitty / Sixel / iTerm2 when the terminal supports
-them, falling back to **Unicode half-blocks** everywhere else. Its default
-`chafa` backend needs the `libchafa` system library, so it is disabled — the
-native protocols plus the half-block fallback cover every terminal with zero
-system deps.
-
-### AI that is optional by construction
-The AI features run against a **local** Ollama over plain HTTP to
-`localhost:11434` — no API keys, no account, nothing leaving the machine, and no
-cost to anyone. They are detected, never assumed: the TUI probes for a server
-once at startup (off-thread, so it never delays the UI) and only advertises the
-shortcut when one answers. With no Ollama installed, `ask` prints a hint and
-every other feature behaves exactly as before. Model choice is by *capability*,
-not by position in the list — an embedding-only model would be rejected by the
-generation endpoint, so completion-capable models are selected explicitly.
-
-### Semantic search: embeddings stored per document, blended with BM25
-Each document gets a unit-normalized embedding at index time (`--semantic`), so
-query-time scoring is a dot product. Ranking is **hybrid** rather than purely
-semantic: keyword scores are min-max normalized and combined as
-`(1 − w)·keyword + w·semantic`. Keeping both signals matters — exact keyword
-matching stays precise for names and identifiers, while the semantic half finds
-the file that discusses "authentication" when you searched for `login`. Because
-the two are unioned, a file can surface by meaning with no keyword hit at all.
-
-### Answering questions: retrieval first, generation second
-`ask` is retrieval-augmented: the index picks the candidate documents, and the
-model only ever sees excerpts from them, with instructions to answer from those
-excerpts or say it can't. The excerpt is a window **centred on the question**,
-not the head of the file — the head is usually imports and licence boilerplate,
-which is exactly how a model ends up claiming there's no information in a file
-that plainly has it. Context length is the dominant cost on a CPU-only machine,
-so few, short, relevant excerpts beat many long ones.
-
-### Errors: one bad file can never take down the run
-`anyhow` for the application, `thiserror` for the library's typed errors. Text
-extraction — `pdf-extract` in particular, which can *panic* on malformed PDFs —
-is isolated behind `catch_unwind` **per file**. A corrupt document is counted as
-an error and skipped; the index build continues.
-
----
-
-## Performance
-
-Measured on this machine (release build):
-
-| Workload | Result |
-|----------|--------|
-| Query latency, 100k docs, single term | **~0.06 ms** |
-| Query latency, 100k docs, 4-term      | **~0.38 ms** |
-| Query latency, 100k docs, fuzzy typo  | **~0.25 ms** |
-| Query latency, 10k on-disk corpus (criterion) | ~3.8 ms single / ~8.8 ms multi |
-
-Comfortably under the **50 ms @ 100k documents** target.
-
-Reproduce:
-```
-cargo run --release --example scale -p deepsearch-core   # 100k in-memory latency
-cargo bench                                              # criterion: indexing + query
+```bash
+wisp pkg add yazi-rs/plugins:smart-enter   # one plugin from a monorepo
+wisp pkg add owner/some-flavor             # flavors work the same way
+wisp pkg list
+wisp pkg upgrade
+wisp pkg delete smart-enter
 ```
 
----
+and bind them as usual (`run = "plugin smart-enter"`). `init.lua` runs after
+the first frame, so `require("x"):setup { … }` and `ps.sub("cd", …)` hooks work
+without slowing start-up; the Lua runtime (Lua 5.4) is only created when a
+plugin or `init.lua` is actually used.
 
-## Testing
+Supported API: `ya.emit` (also `mgr_emit`/`manager_emit`), `ya.notify`,
+`ya.input` (including `realtime = true` receivers), `ya.confirm`, `ya.which`,
+`ya.hide`, `ya.sync`, `ya.clipboard`, `ya.json_decode`/`json_encode`,
+`ya.readable_size`/`readable_path`, `ya.quote`, `ya.hash`, `ya.time`/`sleep`,
+`ya.user_name`/`group_name`/`uid`/`gid`/`host_name`, `ya.target_os`;
+`Command` with `arg`/`cwd`/`env`/`stdin`/`stdout`/`stderr` and
+`output`/`status`/`spawn` (`read_line`, `write_all`, `wait`,
+`wait_with_output`, `start_kill`); `Url` (`name`, `stem`, `ext`, `parent`,
+`join`, `starts_with`, `ends_with`, `strip_prefix`, `into_search`); `fs.cha`,
+`fs.file`, `fs.read_dir`, `fs.write`, `fs.read`, `fs.remove`, `fs.create`,
+`fs.rename`, `fs.copy`, `fs.unique_name`, `fs.cwd`; `ps.sub`/`ps.pub` with
+`cd`, `hover` and `tab` events; `rt` (including a writable `rt.mgr.ratio`);
+and `cx` (tabs, current/parent/preview folders with their files, hovered,
+selected, yanked, mode, preferences). Virtual folders built with
+`url:into_search()` + `update_files` (as `vcs-files` does) show up as a search.
 
+`[plugin] previewers` rules in `yazi.toml` are honoured, including the popular
+`piper` previewer (ANSI colours included):
+
+```toml
+[plugin]
+prepend_previewers = [
+  { url = "*.md", run = 'piper -- glow -s dark -w "$w" "$1"' },
+]
 ```
-cargo test
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all --check
+
+Plugins that render UI work too:
+
+- **Fetchers** (`[plugin] prepend_fetchers`) run for the visible files, e.g.
+  `git.yazi`'s `git status` fetcher.
+- **Linemode / Entity / Status / Header children** registered with
+  `children_add` are drawn in their slots by `order`, and user-defined methods
+  replace the built-in ones (`function Status:name() … end`). Custom linemodes
+  (`function Linemode:size_and_mtime() … end` + `linemode = "size_and_mtime"`)
+  work.
+- **Previewers** (`peek` + `ya.preview_widget`, `ui.Text.parse` for ANSI,
+  `ya.image_show`, falling back to `require("code")` & co.) run on the preview
+  thread with their own Lua state, so a slow previewer never blocks the UI.
+- **Spotters** (`spot` + `ya.spot_table`, `require("file"):spot_base`).
+- `ui` (`Style`, `Span`, `Line`, `Text`, `List`, `Table`, `Row`, `Rect`, `Pad`,
+  `Layout`, `Constraint`, `Align`, `Wrap`, `width`, `truncate`, `render`) and
+  `th` (your theme, including custom sections such as `[git]`).
+
+- **Layout plugins**: wrapping `Tab.layout` / `Tab.build` (borders, resizing
+  the tab area), `Root.layout` (rearranging header / tabs / status), and
+  `Status.redraw` overrides.
+- **List overrides**: `Current.redraw` / `Parent.redraw` replacements run
+  against Lua ports of yazi's own `Entity` / `Linemode` / `Current` /
+  `Parent`, so wrappers that call the original keep working.
+- **Plugin UIs** registered as `Modal` children (e.g. `mount`'s partition
+  table): positioned `Clear` / `Border` / `Table` / `List` / `Text` widgets.
+- **Concurrency**: `ya.join` / `ya.select` with `ya.chan` channels, including
+  `ya.which` / `ya.input` called from inside them.
+
+Verified with the official [yazi-rs/plugins](https://github.com/yazi-rs/plugins)
+(commit `c0529fc`), run unmodified: `git`, `full-border`, `no-status`,
+`smart-enter`, `chmod`, `jump-to-char`, `smart-filter`, `toggle-pane`, `diff`,
+`piper` (with `bat`), `zoom`, `mount`, `vcs-files`, `smart-paste`,
+`visual-pivot`, `term-cwd` and `mime-ext`. Not run: `lsar` and `rclone` (need
+tools not installed on the test machine), `mactag` (macOS only), and
+`compress` (requires yazi ≥ 26.9.1 APIs and 7-Zip).
+
+Built-in versions of the most common functional plugins are available even
+without installing them: `plugin fzf`, `plugin zoxide`, `plugin smart-enter`,
+`plugin toggle-pane <min|max>-<parent|current|preview>`.
+
+### Remote control
+
+Like `ya emit`, commands can be sent to a running instance from any shell. The
+file manager exports `WISP_ID` / `YAZI_ID` (and `YAZI_LEVEL`) to programs
+it starts, so inside its shells `emit` targets it automatically:
+
+```bash
+wisp emit cd ~/Downloads
+wisp emit reveal ~/notes/todo.md
+wisp emit-to 12345 tab_create --current
 ```
 
-The engine is covered by unit tests: the tokenizer (camel/snake splitting,
-stemming, edge cases), the inverted index (aggregates, tombstoning, compaction),
-ranking (idf monotonicity, relevance ordering, name-boost, prefix matching, fuzzy
-tolerance, cosine and hybrid blending, `type:`/`ext:` filter parsing, tombstone
-exclusion), text extraction, incremental add/modify/delete, and directory
-indexing.
+## Deep search
 
-The CLI side covers the open-with app detection, clipboard tool selection, the
-snippet window used for answering, Ollama model selection (an embedding-only
-model must never be chosen for generation), and the preview match-overlay.
+Build the index once (incremental afterwards), then press `F` inside the file
+manager, or query it from the shell:
 
-The **TUI renders into an off-screen `TestBackend`** and the resulting buffer is
-asserted as text, so the layout, the AI badges, the help overlay and the empty
-states can be checked — and regressions caught — without a terminal. Keys are fed
-through the same handler the event loop uses, which is what lets the tests assert
-behaviour rather than appearance: that moving the caret does *not* queue another
-search, that a no-op delete does no work, that `Ctrl-c` is never swallowed by an
-overlay, and that `PageUp` moves by the height the last render actually had.
+```bash
+wisp index ~/Documents            # or `wisp index` for your whole home
+wisp index ~/Documents --incremental
+wisp query "quarterly report"     # ranked results, `--json` for scripts
+wisp stats
+```
 
-The line editor is tested on its own, away from any terminal: caret movement,
-word deletion, multi-byte characters, wide characters measured in cells, and a
-query several times longer than its box.
-
----
+The index covers file names and contents (plain text, code, PDF and DOCX), ranks with BM25 (names weigh more than bodies), handles prefixes
+and typos, and supports `type:` / `ext:` filters (`report type:pdf`).
 
 ## Development
 
-```
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all --check
-```
-
-### Regenerating the demo
-
-The GIF at the top is not a screen recording and nothing in it is hand-drawn. A test drives the
-real `App` with real keystrokes against a real index, renders each step through the same code the
-terminal uses, and writes the resulting cells out as ANSI; a script paints those frames. Change
-the layout and the next regeneration shows the change — the picture cannot quietly drift from the
-product.
-
 ```bash
-cargo run --release -- --cache /tmp/ds-demo.bin index .
-DEMO_CACHE=/tmp/ds-demo.bin \
-    cargo test --release --bin deepsearch capture_demo_frames -- --ignored
-python3 docs/make-demo.py
+cargo test                                   # unit tests + an end-to-end UI test
+cargo build --profile quick                  # optimized, fast to rebuild
+python3 scripts/screen.py --dir . --keys 'jl' -- "$PWD/target/quick/wisp"
 ```
 
-The capture lives in `crates/cli/src/demo.rs` and `capture_demo_frames` in `tui.rs`; painting
-needs ImageMagick with the Pango delegate (`magick -list format | grep PANGO`).
+`scripts/screen.py` renders any TUI to text through a VT emulator, which is how
+the UI is kept identical to yazi's. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the code layout.
 
----
+The defaults in `crates/cli/preset/` are yazi's own presets (MIT), so the out
+of the box behaviour matches yazi exactly.
 
-## Limitations & future work
+## License
 
-- **Stemming is English-only.** Non-English content is still indexed and matched
-  exactly, just not stemmed. Semantic search covers much of this gap: it matches
-  a Spanish question against English documents perfectly well.
-- **First-character typos** are not fuzzy-matched (a deliberate latency
-  trade-off; see above).
-- Fuzzy matching is filename-only, by design (typo tolerance is most useful for
-  names; content is matched via stemming/BM25).
-- **Answering is the one slow feature.** On a CPU-only machine expect roughly a
-  minute per question, dominated by prompt evaluation. A smaller model
-  (`llama3.2:1b`) is markedly faster; a GPU more so.
-- **Building embeddings is a serial pass** — one Ollama call per document, and
-  they're only persisted at the end of the run, so interrupting a large
-  `--semantic` build loses that work. Batching and incremental saves are the
-  obvious next step.
-- `ask` lives in the CLI only; the TUI still searches rather than answers.
-- The index is loaded fully into RAM for querying, and embeddings make it
-  substantially larger. For *very* large corpora a memory-mapped,
-  block-compressed postings format would be the next step.
+MIT

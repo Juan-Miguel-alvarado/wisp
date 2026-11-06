@@ -1,13 +1,13 @@
 [package]
-name = "deepsearch-core"
+name = "wisp-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Indexing + BM25 search engine core for deepsearch (no TUI)."
+description = "Indexing + BM25 search engine core for wisp (no TUI)."
 
 [lib]
-name = "deepsearch_core"
+name = "wisp_core"
 path = "src/lib.rs"
 
 [dependencies]
@@ -22,7 +22,7 @@ dirs = "6"
 infer = "0.19"
 content_inspector = "0.2"
 pdf-extract = "0.9"
-zip = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
 strsim = "0.11"
 

@@ -1,4 +1,4 @@
-# Contributing to deepsearch
+# Contributing to Wisp
 
 Thanks for taking a look! This is a small, dependency-light Rust workspace, so
 getting set up takes one command.
@@ -9,39 +9,58 @@ getting set up takes one command.
   <https://rustup.rs>.
 - No system libraries are required. Image previews use the terminal's own
   graphics protocol; the optional `chafa` backend is deliberately disabled.
+- Optional, for richer previews at runtime: `ffmpegthumbnailer` (video),
+  `pdftoppm` (PDF), `magick` (SVG/HEIC/AVIF/JXL, fonts), `bsdtar`/`7z`
+  (archives), `file` (fallback descriptions).
 
 ## Workspace layout
 
 ```
-crates/core   deepsearch-core — indexing + search engine, no UI (the library)
-crates/cli    deepsearch      — the CLI + interactive TUI
+crates/core   wisp-core — full-text indexing + BM25 search engine (library, no UI)
+crates/cli    wisp      — the file manager + `index`/`query`/`stats` commands
+  preset/     yazi's default yazi.toml / keymap.toml / theme (MIT), our built-in defaults
+scripts/      bench.py (startup benchmark vs. yazi), screen.py (render a TUI to text)
 ```
 
-Start in `crates/core/src` for ranking/indexing changes (`query.rs`,
-`index.rs`, `indexer.rs`, `tokenize.rs`, `extract.rs`) and `crates/cli/src` for
-UI/UX (`tui.rs`, `preview.rs`, `open.rs`, `clip.rs`).
+The file manager lives in `crates/cli/src`:
+
+| module        | what it does                                                        |
+|---------------|---------------------------------------------------------------------|
+| `app.rs`      | state, main loop, loading, watching, terminal hand-off              |
+| `commands.rs` | every keymap command (yazi's names and flags), per layer            |
+| `ui.rs`       | rendering; one function per yazi UI component                       |
+| `config.rs`   | yazi-format config, layering + the compiled-config cache            |
+| `theme.rs`    | `theme.toml`, flavors, filetype rules, icons                        |
+| `keymap.rs`   | keys, chords, commands                                              |
+| `fs.rs`       | entries, parallel directory reads, sorting, MIME detection          |
+| `folder.rs`, `tab.rs` | a listing with cursor/filter; a tab with history/selection  |
+| `preview.rs`  | off-thread previews with an LRU and neighbour prefetch              |
+| `tasks.rs`    | copy/move/link/trash/delete/extract/process tasks with progress     |
+| `search.rs`   | in-process `fd`/`rg`-style search, and deep search via the index    |
+| `input.rs`    | the vi-style line editor used by every prompt                       |
+| `glob.rs`     | the small, fast glob matcher used by all rules                      |
+| `plugin.rs`, `plugin_prelude.lua`, `plugin_ui.lua` | the yazi-compatible Lua plugin runtime: Rust primitives, the `ya`/`Command`/`Url`/`fs`/`ps`/`cx` API, and the `ui`/`th`/component layer rendered natively |
+| `pkg.rs`      | `wisp pkg` (like `ya pkg`)                                    |
+| `remote.rs`   | `wisp emit` / `emit-to` (like `ya emit`) over a Unix socket   |
 
 ## Everyday commands
 
 ```bash
-# Build (debug) / run
-cargo build
-cargo run -- tui                     # run the binary; args go after `--`
+cargo build                          # debug build
+cargo build --profile quick          # optimized, fast to rebuild (for trying things)
+cargo run -- ~/some/dir              # run the file manager
 
-# Try changes on a throwaway index instead of your real one
-cargo run -- --cache /tmp/ds-dev.bin index .
-cargo run -- --cache /tmp/ds-dev.bin query "some words"
-
-# Tests — unit tests live inline in each module
+# Tests — unit tests live inline in each module; app.rs has an end-to-end test
 cargo test
 
 # Lints & formatting — please run both before opening a PR
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
-# Benchmarks (criterion) and the 100k-doc latency example
-cargo bench
-cargo run --release --example scale -p deepsearch-core
+# Compare against yazi (needs yazi installed; screen.py needs `pip install pyte`)
+python3 scripts/bench.py --dir /some/dir --marker some-file -- target/release/wisp
+python3 scripts/bench.py --dir /some/dir --marker some-file -- yazi
+python3 scripts/screen.py --dir . --keys 'jl' -- "$PWD/target/release/wisp"
 ```
 
 ## Before you open a PR
@@ -49,9 +68,9 @@ cargo run --release --example scale -p deepsearch-core
 1. `cargo test` passes.
 2. `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 3. `cargo fmt --all` has been run.
-4. New behaviour has a test. The engine is well covered by unit tests in
-   `crates/core`; match that style (`#[cfg(test)] mod tests` at the bottom of
-   the file, `tempfile` for anything touching the filesystem).
+4. New behaviour has a test (`#[cfg(test)] mod tests` at the bottom of the
+   file, `tempfile` for anything touching the filesystem).
+5. UI changes keep parity with yazi: compare with `scripts/screen.py`.
 
 ## Releasing
 
@@ -59,17 +78,10 @@ Releases are automated. Bump `version` in the workspace `Cargo.toml`, commit,
 then tag and push:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
-The `Release` workflow builds binaries for Linux, macOS (Intel + Apple Silicon)
-and Windows and attaches them (with `.sha256` checksums) to a GitHub Release for
+The `Release` workflow builds binaries for Linux and macOS (Intel + Apple
+Silicon) and attaches them (with `.sha256` checksums) to a GitHub Release for
 that tag. `CI` runs fmt + clippy + tests on every push and PR.
-
-## Design notes
-
-The README's **"Design decisions (and why)"** section explains the choices
-behind the ranker, the tokenizer, incremental indexing, and the preview worker.
-Skim it before a non-trivial change — most "why is it done this way?" questions
-are answered there.

@@ -9,9 +9,9 @@ use std::path::Path;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use deepsearch_core::index::Index;
-use deepsearch_core::indexer::{build, IndexOptions, Progress};
-use deepsearch_core::query::{search, QueryOptions};
+use wisp_core::index::Index;
+use wisp_core::indexer::{build, IndexOptions, Progress};
+use wisp_core::query::{search, QueryOptions};
 
 /// Number of synthetic documents. Kept modest so `cargo bench` stays quick in
 /// CI; raise locally to stress-test.

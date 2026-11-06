@@ -41,32 +41,32 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p deepsearch
+        run: cargo build --release --locked --target ${{ matrix.target }} -p wisp
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           dir="target/${{ matrix.target }}/release"
-          tar -czf "deepsearch-${{ matrix.target }}.tar.gz" -C "$dir" deepsearch
-          shasum -a 256 "deepsearch-${{ matrix.target }}.tar.gz" > "deepsearch-${{ matrix.target }}.tar.gz.sha256"
+          tar -czf "wisp-${{ matrix.target }}.tar.gz" -C "$dir" wisp
+          shasum -a 256 "wisp-${{ matrix.target }}.tar.gz" > "wisp-${{ matrix.target }}.tar.gz.sha256"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $dir = "target/${{ matrix.target }}/release"
-          Compress-Archive -Path "$dir/deepsearch.exe" -DestinationPath "deepsearch-${{ matrix.target }}.zip"
-          (Get-FileHash "deepsearch-${{ matrix.target }}.zip" -Algorithm SHA256).Hash | Out-File "deepsearch-${{ matrix.target }}.zip.sha256"
+          Compress-Archive -Path "$dir/wisp.exe" -DestinationPath "wisp-${{ matrix.target }}.zip"
+          (Get-FileHash "wisp-${{ matrix.target }}.zip" -Algorithm SHA256).Hash | Out-File "wisp-${{ matrix.target }}.zip.sha256"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            deepsearch-${{ matrix.target }}.tar.gz
-            deepsearch-${{ matrix.target }}.tar.gz.sha256
-            deepsearch-${{ matrix.target }}.zip
-            deepsearch-${{ matrix.target }}.zip.sha256
+            wisp-${{ matrix.target }}.tar.gz
+            wisp-${{ matrix.target }}.tar.gz.sha256
+            wisp-${{ matrix.target }}.zip
+            wisp-${{ matrix.target }}.zip.sha256
           fail_on_unmatched_files: false
           # Only one matrix job generates the notes, so they aren't duplicated.
           generate_release_notes: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}

@@ -40,8 +40,11 @@ const TOOLS: &[Tool] = &[
 /// Copy `text` to the clipboard. Returns the tool used on success, or an error
 /// message describing why it couldn't.
 pub fn copy(text: &str) -> Result<&'static str, String> {
-    let Some(tool) = TOOLS.iter().find(|t| on_path(t.program)) else {
-        return Err("no clipboard tool found (install wl-clipboard, xclip or xsel)".to_string());
+    // Over SSH the useful clipboard is the local one: ask the terminal.
+    let remote = std::env::var_os("SSH_TTY").is_some();
+    let tool = TOOLS.iter().find(|t| on_path(t.program));
+    let Some(tool) = tool.filter(|_| !remote) else {
+        return osc52(text);
     };
 
     let mut child = Command::new(tool.program)
@@ -65,6 +68,33 @@ pub fn copy(text: &str) -> Result<&'static str, String> {
         Ok(status) => Err(format!("{} exited with {status}", tool.program)),
         Err(e) => Err(format!("{} failed: {e}", tool.program)),
     }
+}
+
+/// Set the clipboard through the terminal itself (OSC 52), which works in
+/// most modern terminals and across SSH.
+fn osc52(text: &str) -> Result<&'static str, String> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let b = text.as_bytes();
+    let mut enc = String::with_capacity(b.len().div_ceil(3) * 4);
+    for chunk in b.chunks(3) {
+        let n = match chunk.len() {
+            3 => (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8 | chunk[2] as u32,
+            2 => (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8,
+            _ => (chunk[0] as u32) << 16,
+        };
+        for i in 0..4 {
+            if i <= chunk.len() {
+                enc.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                enc.push('=');
+            }
+        }
+    }
+    let mut out = std::io::stdout();
+    out.write_all(format!("\x1b]52;c;{enc}\x07").as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| e.to_string())?;
+    Ok("osc52")
 }
 
 fn on_path(bin: &str) -> bool {

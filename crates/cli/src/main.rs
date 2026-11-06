@@ -1,21 +1,34 @@
-//! `deepsearch` — relevance-ranked full-text search over your files.
+//! `wisp` — a blazing-fast terminal file manager with yazi's UI, keymap
+//! and config format, plus a persistent full-text index for deep search.
 //!
-//! Subcommands:
-//!   * `index [PATH]`   build (or `--incremental` update) the index.
-//!   * `query "<q>"`    one-shot ranked search (`--json` for scripts).
-//!   * `ask "<q>"`      answer a question from your files (local Ollama).
-//!   * `tui [PATH]`     interactive fuzzy search UI.
-//!   * `stats`          report on the current index.
+//! ```text
+//! wisp [ENTRY]            open the file manager (ENTRY: dir, or file to reveal)
+//!   --cwd-file <FILE>          write the last directory to FILE on exit
+//!   --chooser-file <FILE>      file-picker mode: write the chosen paths and exit
+//! wisp index [PATH]      build the full-text index used by deep search (F)
+//! wisp query "<q>"       one-shot ranked search over the index
+//! wisp stats             report on the index
+//! ```
 
-mod ai;
+mod app;
 mod clip;
-// Tooling for the README animation; nothing in the shipped binary needs it.
-#[cfg(test)]
-mod demo;
+mod commands;
+mod config;
+mod event;
+mod folder;
+mod fs;
+mod glob;
 mod input;
-mod open;
+mod keymap;
+mod pkg;
+mod plugin;
 mod preview;
-mod tui;
+mod remote;
+mod search;
+mod tab;
+mod tasks;
+mod theme;
+mod ui;
 mod util;
 
 use std::path::PathBuf;
@@ -26,101 +39,260 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use deepsearch_core::{DeepSearch, IndexOptions, Progress, QueryOptions};
+use wisp_core::{DeepSearch, IndexOptions, Progress, QueryOptions};
 
 #[derive(Parser)]
 #[command(
-    name = "deepsearch",
+    name = "wisp",
     version,
-    about = "Relevance-ranked full-text search over all your files"
+    about = "A blazing-fast terminal file manager (yazi-compatible) with deep full-text search",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
-    /// Path to the index cache (default: ~/.cache/deepsearch/index.bin).
+    /// Directory to open, or a file to reveal.
+    entry: Option<PathBuf>,
+
+    /// Write the cwd on exit to this file (for `cd`-on-quit shell wrappers).
+    #[arg(long)]
+    cwd_file: Option<PathBuf>,
+
+    /// File-chooser mode: write the chosen paths to this file and exit.
+    #[arg(long)]
+    chooser_file: Option<PathBuf>,
+
+    /// Clear the preview/thumbnail cache and exit.
+    #[arg(long)]
+    clear_cache: bool,
+
+    /// Print where configuration is read from and exit.
+    #[arg(long)]
+    debug: bool,
+
+    /// Path to the full-text index cache (default: ~/.cache/wisp/index.bin).
     #[arg(long, global = true)]
     cache: Option<PathBuf>,
 
-    /// Subcommand. When omitted, `deepsearch` launches the interactive TUI.
     #[command(subcommand)]
     cmd: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build or update the index.
+    /// Build or update the full-text index used by deep search.
     Index {
         /// Root directory to index (default: your home directory).
         path: Option<PathBuf>,
         /// Reindex only changed files instead of a full rebuild.
         #[arg(long)]
         incremental: bool,
-        /// Also compute semantic embeddings (search by meaning). Needs a local
-        /// Ollama with an embedding model (`ollama pull nomic-embed-text`).
-        #[arg(long)]
-        semantic: bool,
     },
-    /// Run a one-shot query and print ranked results.
+    /// Run a one-shot query against the index and print ranked results.
     Query {
-        /// The search query (all words joined).
         #[arg(required = true)]
         query: Vec<String>,
-        /// Maximum number of results.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Emit results as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Force keyword-only ranking even if the index has embeddings.
-        #[arg(long)]
-        keyword: bool,
-    },
-    /// Ask a question about your files; a local model answers from their
-    /// contents and cites the sources.
-    Ask {
-        /// The question (all words joined).
-        #[arg(required = true)]
-        request: Vec<String>,
-        /// Maximum number of results.
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Emit results as JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Launch the interactive TUI.
-    Tui {
-        /// Root to index if the cache is empty (default: your home directory).
-        path: Option<PathBuf>,
-    },
-    /// Print statistics about the current index.
+    /// Print statistics about the index.
     Stats,
+    /// Install and manage yazi plugins/flavors (like `ya pkg`):
+    /// `add owner/repo[:name]`, `list`, `upgrade`, `delete <name>`.
+    Pkg {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Send a command to the running instance (like `ya emit`), e.g.
+    /// `wisp emit cd ~/Downloads`.
+    Emit {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Send a command to a specific instance by id (like `ya emit-to`).
+    EmitTo {
+        id: u32,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+pub static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Tests that change process-wide environment variables hold this.
+#[cfg(test)]
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Startup tracing for profiling (`DS_TRACE=1`), printed to stderr.
+pub fn trace(what: &str) {
+    static PATH: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    if let Some(path) = PATH.get_or_init(|| std::env::var_os("DS_TRACE")) {
+        if let Some(s) = START.get() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(f, "{:>10.2?} {what}", s.elapsed());
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let cache = cli.cache.as_deref();
-
-    match cli.cmd {
-        // No subcommand → refresh the index of your home dir, then open the TUI.
-        None => cmd_default(cache),
-        Some(Command::Index {
-            path,
-            incremental,
-            semantic,
-        }) => cmd_index(cache, path, incremental, semantic),
-        Some(Command::Query {
-            query,
-            limit,
-            json,
-            keyword,
-        }) => cmd_query(cache, &query.join(" "), limit, json, keyword),
-        Some(Command::Ask {
-            request,
-            limit,
-            json,
-        }) => cmd_ask(cache, &request.join(" "), limit, json),
-        Some(Command::Tui { path }) => cmd_tui(cache, path),
-        Some(Command::Stats) => cmd_stats(cache),
+    START.get_or_init(std::time::Instant::now);
+    // The common case — plain `wisp` — skips building the clap parser.
+    if std::env::args_os().len() == 1 {
+        return run_fm(None, None, None);
     }
+    let cli = Cli::parse();
+    trace("args");
+    let cache = cli.cache.as_deref();
+    match cli.cmd {
+        Some(Command::Index { path, incremental }) => cmd_index(cache, path, incremental),
+        Some(Command::Query { query, limit, json }) => {
+            cmd_query(cache, &query.join(" "), limit, json)
+        }
+        Some(Command::Stats) => cmd_stats(cache),
+        Some(Command::Pkg { args }) => pkg::run(&args),
+        Some(Command::Emit { args }) => remote::emit(&args, None),
+        Some(Command::EmitTo { id, args }) => remote::emit(&args, Some(id)),
+        None => {
+            if cli.clear_cache {
+                let d = config::cache_dir();
+                let mut n = 0;
+                if let Ok(rd) = std::fs::read_dir(&d) {
+                    for e in rd.flatten() {
+                        if e.path().extension().is_some_and(|x| x == "jpg") {
+                            let _ = std::fs::remove_file(e.path());
+                            n += 1;
+                        }
+                    }
+                }
+                println!("Removed {n} cached thumbnails from {}", d.display());
+                return Ok(());
+            }
+            if cli.debug {
+                return debug_info();
+            }
+            run_fm(cli.entry, cli.cwd_file, cli.chooser_file)
+        }
+    }
+}
+
+fn run_fm(
+    entry: Option<PathBuf>,
+    cwd_file: Option<PathBuf>,
+    chooser_file: Option<PathBuf>,
+) -> Result<()> {
+    remote::export_env();
+    // Three independent start-up jobs run at once: decoding the (cached)
+    // config, reading the starting directory, and setting up the terminal.
+    let config = std::thread::spawn(config::load_all);
+    let (start, _) = app::App::resolve_start(entry.as_deref());
+    let listing = {
+        let start = start.clone();
+        std::thread::spawn(move || {
+            let r = fs::read_dir(&start);
+            warm_up();
+            (start, r)
+        })
+    };
+
+    let main_thread = std::thread::current().id();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Only a panic on the UI thread takes the screen down with it.
+        if std::thread::current().id() == main_thread {
+            app::restore_terminal(true);
+        }
+        hook(info);
+    }));
+    crossterm::terminal::enable_raw_mode()?;
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::BufWriter::with_capacity(
+        1 << 16,
+        std::io::stdout(),
+    ));
+    let mut terminal = ratatui::Terminal::new(backend)?;
+    trace("terminal");
+
+    let loaded = config.join().unwrap_or_else(|_| config::load_all());
+    let mut app = app::App::with_config(
+        app::Options {
+            entry,
+            cwd_file,
+            chooser_file,
+        },
+        loaded,
+    );
+    trace("app built");
+    app::init_terminal(app.cfg.mgr.mouse);
+    trace("term init");
+    let prefetched = listing.join().ok();
+    trace("listing joined");
+    let r = app.run_loop(&mut terminal, prefetched);
+    app::restore_terminal(app.cfg.mgr.mouse);
+    app.finish();
+    r
+}
+
+/// Run the text-drawing paths once, off the main thread, so their code is
+/// already paged in when the first frame needs it.
+fn warm_up() {
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{Paragraph, Widget};
+    let area = Rect::new(0, 0, 120, 4);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    Paragraph::new("warm up ✓ │ 1.2K").render(area, &mut buf);
+    buf.set_stringn(0, 1, "  warm", 10, ratatui::style::Style::default());
+    std::hint::black_box(&buf);
+}
+
+fn debug_info() -> Result<()> {
+    println!("wisp {}", env!("CARGO_PKG_VERSION"));
+    println!("\nConfig search path (first match per file wins):");
+    for d in config::config_dirs() {
+        println!("  {}", d.display());
+    }
+    for f in ["yazi.toml", "keymap.toml", "theme.toml"] {
+        match config::find_user_file(f) {
+            Some(p) => println!("  {f:<12} {}", p.display()),
+            None => println!("  {f:<12} (built-in defaults)"),
+        }
+    }
+    let cfg = config::Config::load();
+    let th = theme::Theme::load();
+    let km = keymap::Keymap::load();
+    println!(
+        "\nRatio {:?}, sort {:?}, linemode {}",
+        cfg.mgr.ratio, cfg.mgr.sort, cfg.mgr.linemode
+    );
+    println!(
+        "{} manager key bindings",
+        km.bindings(keymap::Layer::Mgr).len()
+    );
+    for w in cfg.warnings.iter().chain(&th.warnings).chain(&km.warnings) {
+        println!("warning: {w}");
+    }
+    println!("\nCache: {}", config::cache_dir().display());
+    for t in [
+        "fzf",
+        "zoxide",
+        "ffmpegthumbnailer",
+        "pdftoppm",
+        "magick",
+        "bsdtar",
+        "file",
+        "wl-copy",
+        "xclip",
+    ] {
+        println!(
+            "  {t:<18} {}",
+            if util::on_path(t) { "found" } else { "missing" }
+        );
+    }
+    Ok(())
 }
 
 fn default_root() -> Result<PathBuf> {
@@ -131,21 +303,17 @@ fn cmd_index(
     cache: Option<&std::path::Path>,
     path: Option<PathBuf>,
     incremental: bool,
-    semantic: bool,
 ) -> Result<()> {
     let root = match path {
         Some(p) => p,
         None => default_root()?,
     };
     let opts = IndexOptions::default();
-
-    // For an incremental run we need the previous index; otherwise start fresh.
     let mut ds = if incremental {
         DeepSearch::open_or_empty(cache)?
     } else {
         DeepSearch::empty()
     };
-
     println!(
         "{} {}",
         if incremental {
@@ -155,7 +323,6 @@ fn cmd_index(
         },
         root.display()
     );
-
     let stats = with_progress("Indexing", |progress| {
         if incremental {
             ds.update(&root, &opts, progress)
@@ -163,12 +330,9 @@ fn cmd_index(
             ds.build(&root, &opts, progress)
         }
     });
-
-    // Reclaim space if incremental churn left many tombstones.
     if ds.maybe_compact(0.3) {
         println!("Compacted index (reclaimed tombstoned documents).");
     }
-
     ds.save(cache).context("saving index")?;
     println!(
         "Done: {} indexed, {} unchanged, {} removed, {} errors. {} live documents.",
@@ -178,100 +342,29 @@ fn cmd_index(
         stats.errors,
         ds.len()
     );
-
-    if semantic {
-        build_embeddings(&mut ds, cache)?;
-    }
     Ok(())
 }
 
-/// Weight of the semantic signal in hybrid ranking (0 = keyword only, 1 = pure
-/// semantic).
-const SEMANTIC_WEIGHT: f32 = 0.5;
-
-/// Compute a semantic embedding for every document that lacks one, via Ollama,
-/// then persist. Documents with no extractable text fall back to embedding their
-/// file name so they can still be found by meaning.
-fn build_embeddings(ds: &mut DeepSearch, cache: Option<&std::path::Path>) -> Result<()> {
-    if !ai::embed_available() {
-        println!("Skipping embeddings: {}", ai::embed_setup_hint());
-        return Ok(());
-    }
-    let todo = ds.docs_needing_embedding();
-    let total = todo.len();
-    if total == 0 {
-        println!("Embeddings already up to date.");
-        return Ok(());
-    }
-    println!("Building semantic embeddings for {total} documents (local Ollama)...");
-
-    let mut done = 0usize;
-    let mut failed = 0usize;
-    for (id, path) in todo {
-        let text = match deepsearch_core::extract::extract(&path) {
-            Ok(e) => e.text.unwrap_or_default(),
-            Err(_) => String::new(),
-        };
-        // No body text (image/binary): embed the file name instead.
-        let basis = if text.trim().is_empty() {
-            path.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        } else {
-            text
-        };
-        if basis.trim().is_empty() {
-            continue;
-        }
-        match ai::embed(&basis, false) {
-            Ok(v) => ds.set_embedding(id, v),
-            Err(_) => failed += 1,
-        }
-        done += 1;
-        if done.is_multiple_of(10) || done == total {
-            eprint!("\rembedded {done}/{total}      ");
-        }
-    }
-    eprintln!("\rembedded {done}/{total} documents ({failed} failed).      ");
-    ds.save(cache).context("saving embeddings")?;
-    Ok(())
-}
-
-/// Run a search, using hybrid keyword+semantic ranking when the index has
-/// embeddings and Ollama is reachable; otherwise plain keyword search.
-fn run_search(
-    ds: &DeepSearch,
-    query: &str,
-    opts: &QueryOptions,
-    keyword_only: bool,
-) -> (Vec<deepsearch_core::SearchResult>, bool) {
-    if !keyword_only && ds.has_embeddings() && ai::available() {
-        if let Ok(qv) = ai::embed(query, true) {
-            return (ds.hybrid_search(query, &qv, opts, SEMANTIC_WEIGHT), true);
-        }
-    }
-    (ds.search(query, opts), false)
-}
-
-fn cmd_query(
-    cache: Option<&std::path::Path>,
-    query: &str,
-    limit: usize,
-    json: bool,
-    keyword: bool,
-) -> Result<()> {
+fn cmd_query(cache: Option<&std::path::Path>, query: &str, limit: usize, json: bool) -> Result<()> {
     let ds = load_or_hint(cache)?;
     let opts = QueryOptions {
         limit,
         ..QueryOptions::default()
     };
-    let (results, semantic) = run_search(&ds, query, &opts, keyword);
-    if semantic && !json {
-        eprintln!("(hybrid keyword + semantic)");
-    }
-
+    let results = ds.search(query, &opts);
     if json {
-        print_json(&results);
+        let v: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "score": r.score,
+                    "type": r.file_type.as_str(),
+                    "size": r.size,
+                    "path": r.path.display().to_string(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
     } else if results.is_empty() {
         println!("No results for {query:?}.");
     } else {
@@ -288,201 +381,6 @@ fn cmd_query(
     Ok(())
 }
 
-/// How many files are fed to the model as context when answering a question.
-/// Small on purpose: a local CPU model slows down fast as context grows.
-const ANSWER_SOURCES: usize = 3;
-/// Characters of each file handed to the model — a *relevant* window, not the
-/// head of the file.
-const SNIPPET_CHARS: usize = 700;
-
-/// Locate a question word in `haystack`, tolerating simple inflection: if the
-/// whole word isn't there, retry with successively shorter prefixes so
-/// `passwords` still finds `password`.
-fn find_term(haystack: &str, term: &str) -> Option<usize> {
-    let mut candidate: &str = term;
-    loop {
-        if let Some(pos) = haystack.find(candidate) {
-            return Some(pos);
-        }
-        if candidate.chars().count() <= 4 {
-            return None;
-        }
-        let mut chars = candidate.chars();
-        chars.next_back();
-        candidate = chars.as_str();
-    }
-}
-
-/// Pick the most useful window of `text` for `question`.
-///
-/// Feeding the first N characters of a file usually means feeding its imports
-/// and licence header. Centring the window on the first place a question word
-/// appears gives the model the part that actually bears on the question — which
-/// both improves the answer and keeps the prompt (and so the latency) small.
-fn relevant_snippet(text: &str, question: &str, max_chars: usize) -> String {
-    let lower = text.to_lowercase();
-    let hit = question
-        .to_lowercase()
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-        .filter(|w| w.chars().count() >= 3)
-        .filter_map(|w| find_term(&lower, &w))
-        .min();
-
-    let start = match hit {
-        // Back up a little so the match has context before it.
-        Some(byte_pos) => text[..byte_pos]
-            .chars()
-            .count()
-            .saturating_sub(max_chars / 3),
-        None => 0,
-    };
-    text.chars().skip(start).take(max_chars).collect()
-}
-
-/// Ask a question about your files and get an **answer**, not just a file list.
-///
-/// Retrieval-augmented: the question is used to find the most relevant documents
-/// (semantically when embeddings exist), their text is extracted, and a local
-/// model answers from those excerpts, citing which ones it used.
-fn cmd_ask(
-    cache: Option<&std::path::Path>,
-    question: &str,
-    limit: usize,
-    json: bool,
-) -> Result<()> {
-    if !ai::available() {
-        anyhow::bail!(
-            "asking questions needs a local Ollama server.\n\
-             Install it from https://ollama.com, run `ollama serve`, and pull a model \
-             (e.g. `ollama pull llama3.2`). deepsearch works without it — use `query` instead."
-        );
-    }
-    let ds = load_or_hint(cache)?;
-
-    // 1. Find the files most likely to hold the answer.
-    let opts = QueryOptions {
-        limit: limit.max(ANSWER_SOURCES),
-        ..QueryOptions::default()
-    };
-    let (results, semantic) = run_search(&ds, question, &opts, false);
-    if results.is_empty() {
-        println!("No files matched that question.");
-        return Ok(());
-    }
-
-    // 2. Read the top candidates; skip anything with no extractable text.
-    let mut sources: Vec<(String, String)> = Vec::new();
-    for r in &results {
-        if sources.len() >= ANSWER_SOURCES {
-            break;
-        }
-        if let Ok(ext) = deepsearch_core::extract::extract(&r.path) {
-            if let Some(text) = ext.text {
-                if !text.trim().is_empty() {
-                    let snippet = relevant_snippet(&text, question, SNIPPET_CHARS);
-                    sources.push((r.path.display().to_string(), snippet));
-                }
-            }
-        }
-    }
-    if sources.is_empty() {
-        println!("Found matching files, but none had readable text to answer from.");
-        return Ok(());
-    }
-
-    eprintln!(
-        "reading {} file(s){}…",
-        sources.len(),
-        if semantic { " (semantic match)" } else { "" }
-    );
-
-    // 3. Let the local model answer from those excerpts.
-    let answer = match ai::answer_with_context(question, &sources) {
-        Ok(a) => a,
-        Err(e) => anyhow::bail!("{e}"),
-    };
-
-    if json {
-        print_answer_json(&answer, &sources);
-    } else {
-        println!("\n{answer}\n");
-        println!("Sources:");
-        for (i, (label, _)) in sources.iter().enumerate() {
-            println!("  [{}] {}", i + 1, label);
-        }
-    }
-    Ok(())
-}
-
-/// Hand-rolled JSON for `ask --json` (keeps stdout machine-readable).
-fn print_answer_json(answer: &str, sources: &[(String, String)]) {
-    let esc = |s: &str| {
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-    };
-    println!("{{");
-    println!("  \"answer\": \"{}\",", esc(answer));
-    println!("  \"sources\": [");
-    for (i, (label, _)) in sources.iter().enumerate() {
-        let comma = if i + 1 < sources.len() { "," } else { "" };
-        println!("    \"{}\"{}", esc(label), comma);
-    }
-    println!("  ]");
-    println!("}}");
-}
-
-/// Default action (bare `deepsearch`): incrementally refresh the index of the
-/// home directory, then launch the TUI. The first run is a full build; later
-/// runs only reprocess files whose mtime changed, so startup stays quick.
-fn cmd_default(cache: Option<&std::path::Path>) -> Result<()> {
-    let root = default_root()?;
-    let mut ds = DeepSearch::open_or_empty(cache)?;
-
-    let fresh = ds.is_empty();
-    println!(
-        "{} {} ...",
-        if fresh {
-            "Indexing"
-        } else {
-            "Refreshing index for"
-        },
-        root.display()
-    );
-    with_progress("Indexing", |progress| {
-        ds.update(&root, &IndexOptions::default(), progress)
-    });
-    if ds.maybe_compact(0.3) {
-        println!("Compacted index.");
-    }
-    ds.save(cache).context("saving index")?;
-
-    tui::App::new(ds, QueryOptions::default()).run()
-}
-
-fn cmd_tui(cache: Option<&std::path::Path>, path: Option<PathBuf>) -> Result<()> {
-    let mut ds = DeepSearch::open_or_empty(cache)?;
-
-    // First run with an empty cache: build the index before entering the UI.
-    if ds.is_empty() {
-        let root = match path {
-            Some(p) => p,
-            None => default_root()?,
-        };
-        println!(
-            "No index found — building one for {} first...",
-            root.display()
-        );
-        with_progress("Indexing", |progress| {
-            ds.build(&root, &IndexOptions::default(), progress)
-        });
-        ds.save(cache).context("saving index")?;
-    }
-
-    tui::App::new(ds, QueryOptions::default()).run()
-}
-
 fn cmd_stats(cache: Option<&std::path::Path>) -> Result<()> {
     let ds = load_or_hint(cache)?;
     let idx = ds.index();
@@ -495,25 +393,22 @@ fn cmd_stats(cache: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
-/// Load the index, or print a friendly hint if it hasn't been built yet.
 fn load_or_hint(cache: Option<&std::path::Path>) -> Result<DeepSearch> {
     match DeepSearch::load(cache) {
         Ok(ds) => Ok(ds),
-        Err(deepsearch_core::DeepSearchError::NotFound(_)) => {
-            anyhow::bail!("no index found. Run `deepsearch index` first.")
+        Err(wisp_core::DeepSearchError::NotFound(_)) => {
+            anyhow::bail!("no index found. Run `wisp index` first.")
         }
         Err(e) => Err(e.into()),
     }
 }
 
-/// Run `f`, displaying a live progress line driven by the shared counter.
 fn with_progress<F, R>(label: &str, f: F) -> R
 where
     F: FnOnce(&Progress) -> R,
 {
     let progress = Arc::new(Progress::default());
     let done_flag = Arc::new(AtomicBool::new(false));
-
     let p = progress.clone();
     let flag = done_flag.clone();
     let label_owned = label.to_string();
@@ -529,56 +424,10 @@ where
             std::thread::sleep(Duration::from_millis(100));
         }
     });
-
     let result = f(&progress);
-
     done_flag.store(true, Ordering::Relaxed);
     let _ = printer.join();
     let (done, total) = progress.snapshot();
     eprintln!("\r{label}: {done}/{total} files scanned.            ");
     result
-}
-
-fn print_json(results: &[deepsearch_core::SearchResult]) {
-    // Hand-rolled to avoid a serde_json dependency for a tiny output.
-    println!("[");
-    for (i, r) in results.iter().enumerate() {
-        let comma = if i + 1 < results.len() { "," } else { "" };
-        println!(
-            "  {{\"score\": {:.4}, \"type\": \"{}\", \"size\": {}, \"path\": {:?}}}{}",
-            r.score,
-            r.file_type.as_str(),
-            r.size,
-            r.path.display().to_string(),
-            comma
-        );
-    }
-    println!("]");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snippet_centres_on_the_match() {
-        let text = format!(
-            "{}PASSWORD hashing happens here{}",
-            "x".repeat(500),
-            "y".repeat(500)
-        );
-        let snip = relevant_snippet(&text, "how are passwords handled", 200);
-        assert!(
-            snip.contains("PASSWORD hashing"),
-            "window should include the match"
-        );
-        assert!(snip.chars().count() <= 200);
-    }
-
-    #[test]
-    fn snippet_falls_back_to_head_without_a_match() {
-        let text = "alpha beta gamma delta";
-        let snip = relevant_snippet(text, "zzzz nothing matches", 10);
-        assert_eq!(snip, "alpha beta");
-    }
 }
