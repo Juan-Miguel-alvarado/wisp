@@ -1,6 +1,6 @@
 # Wisp
 
-[![Release](https://img.shields.io/github/v/release/Juan-Miguel-alvarado/Deepsearch?sort=semver)](https://github.com/Juan-Miguel-alvarado/Deepsearch/releases/latest)
+[![Release](https://img.shields.io/github/v/release/Juan-Miguel-alvarado/wisp?sort=semver)](https://github.com/Juan-Miguel-alvarado/wisp/releases/latest)
 
 A terminal file manager with [yazi](https://github.com/sxyazi/yazi)'s UI, keymap
 and config format — **several times faster to start, far lighter on memory, and
@@ -118,7 +118,7 @@ Where the speed comes from:
 ### Prebuilt binary
 
 Grab the archive for your platform from the
-[latest release](https://github.com/Juan-Miguel-alvarado/Deepsearch/releases/latest),
+[latest release](https://github.com/Juan-Miguel-alvarado/wisp/releases/latest),
 extract it and put `wisp` on your `PATH`:
 
 ```bash
@@ -129,7 +129,7 @@ install -m 755 wisp ~/.local/bin/
 ### From source
 
 ```bash
-cargo install --git https://github.com/Juan-Miguel-alvarado/Deepsearch wisp
+cargo install --git https://github.com/Juan-Miguel-alvarado/wisp wisp
 # or, from a clone:
 cargo build --release && cp target/release/wisp ~/.local/bin/
 ```
