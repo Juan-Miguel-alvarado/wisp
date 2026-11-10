@@ -2,14 +2,16 @@
 
 [![Release](https://img.shields.io/github/v/release/Juan-Miguel-alvarado/wisp?sort=semver)](https://github.com/Juan-Miguel-alvarado/wisp/releases/latest)
 
-A terminal file manager with [yazi](https://github.com/sxyazi/yazi)'s UI, keymap
-and config format — **several times faster to start, far lighter on memory, and
-an order of magnitude faster on huge directories** — plus deep full-text search
-inside your documents (PDF, DOCX, code, text).
+A blazing-fast terminal file manager written in Rust, compatible with
+[yazi](https://github.com/sxyazi/yazi): the same UI, keymap, config format and
+Lua plugin API — **6–14× faster to start, ~7× lighter on memory, and an order of
+magnitude faster on huge directories** — plus deep full-text search inside your
+documents (PDF, DOCX, code, text).
 
-If you know yazi you already know Wisp: same three-column layout, same
-keys, same popups, and it reads your existing `~/.config/yazi/` theme, keymap
-and openers as they are.
+If you know yazi you already know Wisp: same three-column layout, same keys,
+same popups. It reads your existing `~/.config/yazi/` theme, keymap, openers and
+plugins as they are, and runs the official yazi plugins unmodified. Runs on
+Linux and macOS.
 
 ```
 wisp            # open the file manager in the current directory
